@@ -72,16 +72,16 @@ The **page frame number (PFN)** is the frame's physical address divided by the p
 
 The allocator manages **frames**, not pages. It gives you a physical address (or PFN) of an available frame. The page table manager (Chapter 10) maps virtual pages to physical frames. This separation is clean and important: the frame allocator knows nothing about virtual memory, and the page table manager knows nothing about which frames are free.
 
-### Why 4 KiB Pages?
+<details>
+<summary>Why is 4 KiB the standard page size, not something smaller or larger?</summary>
+<div>
 
-4 KiB is a balance between several competing concerns:
+4 KiB balances several competing concerns. Smaller pages reduce internal fragmentation and waste, but require larger page tables and more TLB entries. Larger pages reduce page table overhead and TLB pressure, but waste memory for small allocations. 4 KiB has been standard since the VAX in 1977 and is deeply embedded in hardware and software.
 
-- **Smaller pages** give finer-grained memory allocation (less [internal fragmentation](https://en.wikipedia.org/wiki/Fragmentation_(computing)#Internal_fragmentation)) but require larger page tables (more entries to cover the same address range) and more [TLB](https://en.wikipedia.org/wiki/Translation_lookaside_buffer) entries (more translations to cache).
-- **Larger pages** (2 MiB "megapages" or 1 GiB "gigapages" on Sv39) reduce page table size and TLB pressure but waste memory for small allocations and complicate the allocator.
+</div>
+</details>
 
-4 KiB has been the standard page size since the VAX in 1977. It's embedded deep in OS design, hardware architecture, and file system block sizes. RISC-V Sv39 uses 4 KiB as the base page size, with 2 MiB and 1 GiB superpages available.
-
-For your OS, you'll allocate and manage 4 KiB frames exclusively. Superpages are an optimization for later (or never — they're complex and not needed for a teaching OS).
+For your OS, you'll allocate and manage 4 KiB frames exclusively. Superpages (2 MiB and 1 GiB) are optimizations for later (or never — they're complex and not needed for a teaching OS).
 
 ---
 
@@ -103,7 +103,14 @@ After freeing frame A:
   free_list → [frame A] → [frame B] → [frame C] → ... → NULL
 ```
 
-Each "node" in the list is not a separately allocated struct — it's the *frame itself*. Since a free frame isn't being used for anything, you can store the "next" pointer in the first 8 bytes of the frame. This is a beautiful trick: the free list metadata is stored in the free memory itself, requiring zero additional overhead.
+<details>
+<summary>Why can the "next" pointer be stored inside the free frame itself?</summary>
+<div>
+
+A free frame isn't being used for anything — all 4096 bytes are available. So you store the 8-byte "next" pointer in the first 8 bytes of the frame. When the frame is allocated, the caller overwrites it with whatever they want. The metadata only exists while the frame is free, costing zero additional memory.
+
+</div>
+</details>
 
 This means a free frame, viewed as a struct, looks like:
 
@@ -120,6 +127,15 @@ When you free a frame, you write a "next" pointer at its start (pointing to the 
 
 ### Initialization
 
+<details>
+<summary>Does the order matter when you add frames to the free list during initialization?</summary>
+<div>
+
+The order doesn't affect correctness, but adding from high addresses to low addresses means the free list head points to the lowest free frame. This makes the first allocation return the lowest address, which is helpful for debugging (you can predict which addresses will be allocated).
+
+</div>
+</details>
+
 At boot, you need to build the initial free list. Walk through all frames from `_kernel_end` to the end of physical memory, and add each one to the free list:
 
 ```
@@ -129,17 +145,14 @@ for each frame address from kernel_end to memory_end, step 4096:
 
 Adding a frame means: write the current free list head into the first 8 bytes of the frame, then update the head to point to this frame.
 
-The order doesn't matter functionally, but adding frames from high addresses to low addresses means the free list head points to the lowest free frame, so the first allocation returns the lowest address. This isn't important for correctness but can be helpful for debugging.
+<details>
+<summary>Why must `_kernel_end` be page-aligned for the frame allocator to work?</summary>
+<div>
 
-### Page-Aligning kernel_end
+The allocator walks frames in PAGE_SIZE steps. If `kernel_end` is at address `0x80005A00` (not page-aligned), you'd skip valid frames or include kernel memory in the free list. The alignment formula `(kernel_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)` rounds up to the next page boundary.
 
-The `_kernel_end` symbol from your linker script should already be page-aligned (because you used `ALIGN(4096)` in the linker script). If it isn't, round it up to the next page boundary before using it as the start of free memory:
-
-```
-start = (kernel_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)
-```
-
-This is the standard "round up to alignment" formula. `PAGE_SIZE - 1` creates a mask of the low bits, `~(PAGE_SIZE - 1)` creates a mask of the high bits, and the AND clears the low bits. Adding `PAGE_SIZE - 1` before masking ensures we round up, not down.
+</div>
+</details>
 
 ---
 
@@ -153,19 +166,14 @@ Your frame allocator should expose two functions:
 
 That's the complete interface. One function to get a page, one function to give it back.
 
-### Zeroing on Allocation (or Deallocation)
+<details>
+<summary>Should `kalloc` return zeroed or unzeroed memory, and when?</summary>
+<div>
 
-Should `kalloc` return zeroed memory? Arguments for:
-- Many callers need zeroed pages (page tables, BSS segments of new processes). If `kalloc` zeroes, callers don't have to.
-- Stale data in recycled frames is a security concern (process A's data visible to process B through a recycled frame).
+There are tradeoffs. Zeroing on allocation is safer (prevents information leaks) but slower. Zeroing on free reuses the write you must do anyway (for the next pointer), but makes free slower. Some implementations provide both `kalloc()` and `kalloc_zeroed()`. For a teaching OS, zeroing on allocate is the safest default—the performance cost is negligible on QEMU.
 
-Arguments against:
-- Zeroing a 4 KiB page takes time. Not much, but it adds up if you're allocating many pages.
-- Some callers will immediately overwrite the page (e.g., loading a program segment), making the zeroing wasted.
-
-A common compromise: provide both `kalloc()` (returns unzeroed memory) and `kalloc_zeroed()` (returns zeroed memory). Or zero on free rather than on allocate — the logic being that you're about to modify `next` pointer anyway, so you might as well zero the rest. xv6 zeroes on `kfree` (fills the page with the byte `0x01` as a "junk" pattern, though this isn't zero — it's a debug aid to catch use-after-free).
-
-For your initial implementation, zeroing on allocate is the safest default. The performance cost is negligible on QEMU.
+</div>
+</details>
 
 > **Aside: The buddy allocator and beyond**
 >
@@ -185,9 +193,23 @@ A few safety measures worth implementing:
 
 **Bounds checking on free.** When `kfree(pa)` is called, verify that `pa` is within the valid physical memory range and is page-aligned. If it isn't, you have a bug somewhere — panic rather than silently corrupting the free list.
 
-**[Double-free detection](https://en.wikipedia.org/wiki/Double_free).** If you free a frame that's already free, you create a cycle in the free list (or duplicate the frame), leading to the same physical frame being returned by two different `kalloc` calls, leading to two kernel components overwriting each other's data. A simple detection method: when freeing a frame, fill it with a known pattern (e.g., `0xDEAD`). Before adding it to the free list, check if the pattern is already there. If so, it's a double-free. This isn't foolproof but catches the most common case.
+<details>
+<summary>Why is double-free such a serious bug, and how do you detect it?</summary>
+<div>
 
-**[Use-after-free](https://en.wikipedia.org/wiki/Use-after-free) detection.** When freeing a frame, fill it with a junk pattern (e.g., all bytes set to `0xAA`). If code accesses the freed frame and sees `0xAA` patterns, it's a clue that it's using freed memory. This doesn't prevent the bug, but it makes the symptoms more recognizable.
+Double-freeing creates a cycle in the free list, so the same frame is returned twice. Two kernel components then overwrite each other's data. Detection: fill freed frames with a known pattern (e.g., `0xDEAD`), then check if the pattern is already there before freeing again. This catches the most common cases.
+
+</div>
+</details>
+
+<details>
+<summary>How do you detect use-after-free bugs, which don't create an immediate crash?</summary>
+<div>
+
+Fill freed frames with a junk pattern (e.g., all bytes `0xAA`). If code later accesses the freed frame and sees this pattern, it's using freed memory. This doesn't prevent the bug, but makes symptoms more recognizable than random data.
+
+</div>
+</details>
 
 These are debugging aids, not security measures. On a production OS, you'd use more robust techniques. For a teaching OS, they'll save you hours of debugging when you inevitably free something you shouldn't, or use something after you've freed it.
 

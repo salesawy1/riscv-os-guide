@@ -486,6 +486,77 @@
     border-radius: 8px;
   }
 
+  /* ── Collapsible Q&A Dropdowns ── */
+  .content details {
+    margin: 20px 0;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    transition: border-color 0.15s;
+  }
+
+  .content details[open] {
+    border-color: var(--accent);
+  }
+
+  .content details summary {
+    padding: 14px 18px;
+    cursor: pointer;
+    font-family: var(--font-sans);
+    font-size: 0.92rem;
+    font-weight: 600;
+    color: var(--text);
+    background: var(--bg-sidebar);
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    transition: background 0.12s;
+    line-height: 1.4;
+    user-select: none;
+  }
+
+  .content details summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .content details summary::before {
+    content: '▶';
+    font-size: 0.65rem;
+    color: var(--accent);
+    transition: transform 0.15s ease;
+    flex-shrink: 0;
+  }
+
+  .content details[open] summary::before {
+    transform: rotate(90deg);
+  }
+
+  .content details summary:hover {
+    background: var(--accent-light);
+  }
+
+  .content details > div,
+  .content details > p {
+    padding: 16px 18px;
+    border-top: 1px solid var(--border);
+    font-family: var(--font-serif);
+    font-size: 0.95rem;
+    line-height: 1.75;
+  }
+
+  .content details > div p:last-child {
+    margin-bottom: 0;
+  }
+
+  .content details code {
+    font-size: 0.82em;
+  }
+
+  .content details pre {
+    margin: 12px 0;
+  }
+
   /* ── Chapter Nav ── */
   .chapter-nav {
     display: flex;
@@ -791,11 +862,17 @@ function renderMarkdown(md) {
     return `<pre><code class="language-${lang}">${escaped}</code></pre>`;
   });
 
-  // Split into blocks by double newline, but preserve code blocks
-  const codeBlocks = [];
+  // Preserve HTML blocks (details, code blocks) from paragraph wrapping
+  const preserved = [];
+  // Preserve details blocks first
+  html = html.replace(/<details[\s\S]*?<\/details>/g, m => {
+    preserved.push(m);
+    return `\x00PRESERVED${preserved.length - 1}\x00`;
+  });
+  // Preserve code blocks
   html = html.replace(/<pre><code[\s\S]*?<\/code><\/pre>/g, m => {
-    codeBlocks.push(m);
-    return `\x00CODE${codeBlocks.length - 1}\x00`;
+    preserved.push(m);
+    return `\x00PRESERVED${preserved.length - 1}\x00`;
   });
 
   // Tables
@@ -853,8 +930,8 @@ function renderMarkdown(md) {
   // Collapse consecutive <p> tags that should be one paragraph
   html = html.replace(/<\/p>\n<p>/g, '<br>');
 
-  // Restore code blocks
-  html = html.replace(/\x00CODE(\d+)\x00/g, (_, i) => codeBlocks[i]);
+  // Restore preserved blocks (details, code)
+  html = html.replace(/\x00PRESERVED(\d+)\x00/g, (_, i) => preserved[i]);
 
   return html;
 }

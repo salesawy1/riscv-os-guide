@@ -31,25 +31,14 @@ When a user program executes `[ecall](https://github.com/riscv/riscv-isa-manual/
 11. The trap return restores registers and `sret` returns to U-mode
 12. The user program continues, with the result in `a0`
 
-### The System Call Number Convention
+<details>
+<summary>Why do system call numbers go in a7 specifically?</summary>
+<div>
 
-The system call number in `a7` identifies which kernel service is requested. You define these numbers:
+The system call number in `a7` identifies which kernel service is requested. By convention, a7 is not used for regular function arguments (the RISC-V calling convention uses a0-a5 for the first 6 arguments, and a7 is available for other purposes). This allows the kernel to read the system call number from a7 without conflicting with the argument registers. The numbers themselves are arbitrary — they're a contract between the kernel and user programs. Linux has its own set (defined in architecture-specific headers), and xv6 has a small set of about 20.
 
-```
-#define SYS_fork    1
-#define SYS_exit    2
-#define SYS_wait    3
-#define SYS_read    4
-#define SYS_write   5
-#define SYS_open    6
-#define SYS_close   7
-#define SYS_exec    8
-#define SYS_sbrk    9
-#define SYS_getpid  10
-// ... etc
-```
-
-The numbers are arbitrary — they're a contract between the kernel and user programs. Linux has its own set (defined in architecture-specific headers). xv6 has a small set of about 20.
+</div>
+</details>
 
 ### The Dispatch Table
 
@@ -80,11 +69,16 @@ void syscall_dispatch(struct trapframe *tf) {
 }
 ```
 
-### Argument Passing
+<details>
+<summary>Why does the kernel read arguments from the trap frame instead of registers?</summary>
+<div>
 
-System call arguments are passed in registers `a0`–`a5`, the same registers used for C function arguments. This is convenient — the user program's C library function can put arguments in the right registers and execute `ecall`, and the kernel handler reads them directly from the trap frame.
+System call arguments are passed in registers `a0`–`a5`, the same registers used for C function arguments. The trap frame saved these register values when the trap occurred, so the kernel handler reads them from the trap frame. This is convenient — the user program's C library function can put arguments in the right registers and execute `ecall`, and the kernel handler reads them directly from the saved trap state without needing to do anything special.
 
 For arguments that are pointers to user memory (strings, buffers), the kernel must use `copyin`/`copyout` (from Chapter 17) to safely [copy data between kernel and user space](https://pages.cs.wisc.edu/~remzi/OSTEP/cpu-mechanisms.pdf). Never dereference a user pointer directly.
+
+</div>
+</details>
 
 > **Aside: System call overhead**
 >
@@ -130,7 +124,11 @@ Here are the system calls you should implement, roughly in order of priority:
 
 ## The sbrk System Call
 
-[`sbrk`](https://en.wikipedia.org/wiki/Sbrk) is how user programs get heap memory. The process's address space has a "[program break](https://en.wikipedia.org/wiki/Data_segment)" — the boundary between mapped and unmapped memory above the data segment. `sbrk(n)` moves this boundary up by `n` bytes, effectively allocating `n` bytes of heap space.
+<details>
+<summary>How does malloc get memory if it can't directly allocate pages?</summary>
+<div>
+
+[`sbrk`](https://en.wikipedia.org/wiki/Sbrk) is how user programs get heap memory. The process's address space has a "[program break](https://en.wikipedia.org/wiki/Data_segment)" — the boundary between mapped and unmapped memory above the data segment. `sbrk(n)` moves this boundary up by `n` bytes, effectively allocating `n` bytes of heap space. The user program's `malloc` calls `sbrk` to get large chunks from the kernel, then subdivides them into smaller allocations. This is the same [free list algorithm](https://en.wikipedia.org/wiki/Free_list) from Chapter 12, but running in user space on top of `sbrk`-provided memory.
 
 Implementation:
 1. Read the current program break from the PCB
@@ -139,20 +137,26 @@ Implementation:
 4. Update the program break in the PCB
 5. Return the old program break (the start of the newly allocated region)
 
-The user program's `malloc` calls `sbrk` to get large chunks from the kernel, then subdivides them into smaller allocations. This is the same [free list algorithm](https://en.wikipedia.org/wiki/Free_list) from Chapter 12, but running in user space on top of `sbrk`-provided memory.
+</div>
+</details>
 
 ---
 
-## Error Handling
+<details>
+<summary>Why do system calls return -1 on error instead of throwing exceptions?</summary>
+<div>
 
-System calls can fail. The convention: return -1 (or a negative value) on error, and set an error code. In a simple teaching OS, returning -1 on error is sufficient. A more complete OS would set `errno` (which requires per-process or per-thread storage accessible from user space).
-
-Common error conditions:
+System calls can fail. The convention: return -1 (or a negative value) on error, and set an error code. In a simple teaching OS, returning -1 on error is sufficient. A more complete OS would set `errno` (which requires per-process or per-thread storage accessible from user space). Common error conditions include:
 - `fork`: no free process slots, out of memory
 - `wait`: no children
 - `read`/`write`: invalid file descriptor, invalid buffer pointer
 - `exec`: file not found, not executable
 - `sbrk`: out of memory
+
+This error convention is simple and efficient — the caller checks the return value and can decide how to handle the error in user space, rather than requiring kernel intervention for exception handling.
+
+</div>
+</details>
 
 ---
 
@@ -178,7 +182,14 @@ Common error conditions:
 
 2. **Implement the dispatch table** and a `syscall_dispatch` function.
 
-3. **Advance `sepc` by 4** after handling an ecall (so the user returns to the instruction after `ecall`, not back to `ecall` itself).
+3. <details>
+<summary>Why must the kernel advance sepc by 4 after an ecall?</summary>
+<div>
+
+After handling the system call, `sepc` still points to the `ecall` instruction. Without advancing it, the trap return would jump back to `ecall`, causing the user program to execute it again, creating an infinite loop. The kernel advances `sepc` by 4 (the size of the ecall instruction) so the user program resumes at the instruction after `ecall`.
+
+</div>
+</details>
 
 ### Implement System Calls
 

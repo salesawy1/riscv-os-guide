@@ -138,15 +138,23 @@ la sp, stack_top
 
 The [`la`](https://gcc.gnu.org/onlinedocs/gcc/Extended-Asm.html) (load address) [pseudoinstruction](https://github.com/riscv/riscv-isa-manual) loads the address of `stack_top` into `sp`. Since the stack grows downward, `sp` starts at the *top* of the allocated region. As functions are called, `sp` decreases toward `stack_bottom`.
 
-### Why 16 KiB?
+<details>
+<summary>Why is 16 KiB better than 4 KiB for the kernel stack?</summary>
+<div>
 
-4096 bytes (one page) is the absolute minimum for a kernel stack. It's enough for simple call chains but can overflow if you have deep recursion or large local variables. 16 KiB (four pages) is a common choice for kernel stacks — it's what Linux uses for its kernel stacks on many architectures. For a teaching OS, 16 KiB is generous. You could start with 4 KiB and increase it if you hit stack overflows, but 16 KiB avoids the issue entirely.
+4096 bytes (one page) is the absolute minimum — enough for simple call chains but risky for deep recursion or large local variables. Linux uses 16 KiB for its kernel stacks. A larger stack prevents overflows that are hard to debug. You could start with 4 KiB and grow it, but 16 KiB is a reasonable upfront choice for a teaching OS.
 
-### Alignment
+</div>
+</details>
 
-The RISC-V calling convention requires the stack pointer to be 16-byte aligned at function entry. The `.align 16` directive before the stack region ensures that `stack_bottom` is 16-byte aligned. Since the stack size (16 KiB) is a multiple of 16, `stack_top` is also aligned. If you choose a stack size that isn't a multiple of 16, you'll need to align `stack_top` explicitly.
+<details>
+<summary>What happens if the stack pointer isn't 16-byte aligned?</summary>
+<div>
 
-A misaligned stack pointer won't always crash immediately — many instructions tolerate misalignment. But the calling convention requires it, and some operations (particularly those involving floating-point or atomic instructions) may fault on a misaligned `sp`. Don't risk it.
+Many instructions tolerate misalignment, so you won't always see immediate crashes. But the calling convention requires 16-byte alignment, and some operations (floating-point, atomics) fault on misaligned `sp`. The `.align 16` directive before the stack region guarantees both `stack_bottom` and `stack_top` are aligned, as long as the stack size is a multiple of 16 (which 16 KiB is).
+
+</div>
+</details>
 
 > **Aside: Why the stack grows downward**
 >
@@ -166,7 +174,14 @@ Your boot stub needs to:
 2. Load the address of `_bss_end` into another register
 3. Loop, storing zero to each doubleword (8-byte) location from `_bss_start` to `_bss_end`
 
-Why doubleword stores (`sd`) instead of byte stores (`sb`)? Performance. Storing 8 bytes at a time is 8x faster than storing 1 byte at a time. Your `.bss` section is page-aligned at both ends (thanks to your linker script), so the start and end addresses are 8-byte aligned. You can safely use `sd` without worrying about alignment issues.
+<details>
+<summary>Why use 8-byte stores instead of 1-byte stores for BSS zeroing?</summary>
+<div>
+
+Storing 8 bytes at a time is 8x faster than 1-byte stores. The `.bss` section is page-aligned at both ends (from your linker script), so both `_bss_start` and `_bss_end` are 8-byte aligned. This makes `sd` (store doubleword) safe and efficient.
+
+</div>
+</details>
 
 ### The Loop
 
@@ -185,19 +200,32 @@ done:
 
 This is straightforward, but there are two pitfalls:
 
-**Pitfall 1: `_bss_start` and `_bss_end` are linker symbols, not variables.** In assembly, you load their addresses with `la` (load address), not `ld` (load from memory). `la reg, _bss_start` puts the address of the symbol into the register. `ld reg, _bss_start` would try to load a value from that address, which is not what you want (and would give you garbage).
+<details>
+<summary>What's the difference between `la` and `ld` when loading BSS addresses?</summary>
+<div>
 
-**Pitfall 2: If `.bss` is empty, `_bss_start` equals `_bss_end`.** Your loop must handle this case — if start equals end, skip the loop entirely. The `bge` (branch if greater or equal) at the top handles this: if A >= B on the first check, it jumps straight to `done`.
+`la` (load address) puts the symbol's address into a register — what you want for a pointer to BSS. `ld` (load from memory) tries to fetch a value FROM that address, giving you garbage. For linker symbols, always use `la`.
 
-### Why This Matters
+</div>
+</details>
 
-If you skip BSS zeroing, you'll get bugs like:
+<details>
+<summary>What happens if the `.bss` section is empty?</summary>
+<div>
 
-- A global counter that should start at 0 starts at some random value
-- A global pointer that should be `NULL` points to garbage, and dereferencing it corrupts memory somewhere else in your kernel
-- A global flag that should be "false" (0) appears "true" (non-zero), causing initialization code to skip important setup
+Then `_bss_start == _bss_end`. Your loop condition must check this: a `bge` (branch if >=) at the start handles it by jumping to `done` immediately if start >= end. Empty BSS is valid; your loop just does nothing.
 
-These bugs are insidious because they're intermittent — they depend on whatever happened to be in RAM at those addresses. On QEMU, RAM is often zeroed at startup, so your kernel might work on QEMU and fail on real hardware. The BSS zeroing loop costs a few microseconds and prevents an entire class of bugs. Do it.
+</div>
+</details>
+
+<details>
+<summary>What bugs occur if you skip BSS zeroing?</summary>
+<div>
+
+Global variables won't be zero-initialized. A counter expected to be 0 might be random. A pointer might point to garbage, causing silent memory corruption. A flag might appear "true" when it should be "false," causing wrong code paths. These bugs are intermittent — they depend on whatever was in RAM. QEMU often zeros RAM at startup, masking the problem, but real hardware won't. BSS zeroing costs microseconds and prevents an entire class of bugs.
+
+</div>
+</details>
 
 ---
 
@@ -209,22 +237,23 @@ Once the stack is set and BSS is zeroed, you can call your C entry point. In ass
 call kernel_main
 ```
 
-The [`call`](https://github.com/riscv/riscv-isa-manual) pseudoinstruction expands to `auipc ra, offset_high` + `jalr ra, offset_low(ra)`, which computes the address of `kernel_main`, stores the return address in `ra`, and jumps. If `kernel_main` is close enough (within ±1 MiB), the assembler might use a single `jal` instead.
+<details>
+<summary>Why does the boot stub need a spin loop after `call kernel_main`?</summary>
+<div>
 
-After `kernel_main` returns (which it shouldn't — your main loop should be infinite), your boot stub should enter a spin loop to prevent the CPU from executing random memory:
+The `call` instruction stores the return address in `ra` and jumps to `kernel_main`. If `kernel_main` returns (which it shouldn't, but if it does), the CPU would execute random memory. A `wfi` + `j` loop at the return point prevents this. `wfi` puts the core into low-power sleep, saving CPU time. On real hardware, if somehow execution reaches the spin loop, at least the core idles cleanly instead of corrupting memory.
 
-```
-    call kernel_main
-spin:
-    wfi
-    j spin
-```
+</div>
+</details>
 
-The `wfi` + `j` loop is the "I've finished everything and have nothing left to do" pattern. On real hardware, `wfi` puts the core into low-power sleep. On QEMU, it saves host CPU time.
+<details>
+<summary>Why not just name it `main` like normal C programs?</summary>
+<div>
 
-### Why `kernel_main` and Not `main`?
+You could. But `main` in hosted C programs can have special compiler-assigned semantics (return type assumptions, implicit handling). Using `kernel_main` clarifies that this is a freestanding entry point, not a hosted main. It's a naming convention that prevents confusion. xv6 uses `main()`, but `kernel_main` is common in OS tutorials. Either works — just be consistent.
 
-You can name your entry function anything you want. `main` is conventional for hosted C programs, and the compiler may attach special semantics to it (like assuming it returns `int` and adding implicit return value handling). Using `kernel_main` makes the distinction clear: this is a freestanding entry point, not a hosted `main()`. The xv6 kernel uses `main()` without issues, but `kernel_main()` is a common convention in OS development tutorials. Choose one and be consistent.
+</div>
+</details>
 
 ---
 
@@ -348,29 +377,23 @@ The proof that you got here is the GDB breakpoint. In the next chapter, you'll r
 
 ---
 
-## A Deeper Look at the `la` Pseudoinstruction
+<details>
+<summary>How does `la` expand when RISC-V instructions only have 20-bit immediates?</summary>
+<div>
 
-You'll use `la` (load address) extensively in your boot assembly. It's worth understanding what the assembler actually emits, because when something goes wrong, you'll see the real instructions in the disassembly, not the pseudoinstruction.
+`la rd, symbol` loads a 64-bit address into `rd`, but RISC-V immediates are only 20 bits. The assembler expands it to two instructions: `lui` (load upper immediate, 20 bits) + `addi` (add immediate, 12 bits). Or, for PC-relative addresses: `auipc` (add upper immediate to PC, 20 bits) + `addi` (12 bits). With `-mno-relax`, you get the full two-instruction sequence; with linker relaxation enabled, the linker might collapse it to one instruction if the symbol is close.
 
-`la rd, symbol` loads the address of `symbol` into register `rd`. On RV64, an address is 64 bits wide, but RISC-V instructions can only carry a 32-bit immediate (20 bits in `lui`/`auipc`, plus 12 bits in `addi`/`jalr`). So how do you load a 64-bit address?
+</div>
+</details>
 
-For addresses in the first 4 GiB (like `0x80000000`), two instructions suffice:
+<details>
+<summary>Why does it matter to understand how `la` expands to real instructions?</summary>
+<div>
 
-1. [`lui`](https://github.com/riscv/riscv-isa-manual) rd, upper_20_bits — Loads the upper 20 bits into bits 31:12 of `rd`, sign-extending to 64 bits. For `0x80000000`, this is `lui rd, 0x80000`.
-2. [`addi`](https://github.com/riscv/riscv-isa-manual) rd, rd, lower_12_bits — Adds the lower 12 bits. For `0x80000000`, the lower 12 bits are 0, so this step might be omitted by the assembler.
+When debugging with `objdump`, you'll see `auipc` + `addi` sequences instead of `la`. If the offsets are wrong, your address is wrong. Verify critical addresses with GDB: after `la sp, stack_top` executes, check `info registers sp` against `objdump -t` output. Mismatched stack pointers or BSS addresses cause catastrophic bugs that are hard to trace.
 
-Or, for PC-relative addressing (which is what `la` often generates):
-
-1. [`auipc`](https://github.com/riscv/riscv-isa-manual) rd, offset_upper — Adds the upper 20 bits of the offset to the current PC and stores in `rd`.
-2. [`addi`](https://github.com/riscv/riscv-isa-manual) rd, rd, offset_lower — Adds the lower 12 bits of the offset.
-
-The choice between absolute (`lui`/`addi`) and PC-relative (`auipc`/`addi`) depends on the assembler and [linker relaxation](https://sourceware.org/binutils/docs/ld/Scripts.html) settings. With `-mno-relax` (which we use), the assembler generates the full two-instruction sequence. With linker relaxation enabled, the linker might reduce this to a single instruction if the symbol is close enough.
-
-Why does this matter? Two reasons:
-
-1. **Disassembly.** When you `objdump -d` your kernel and see `auipc a0, 0x0` followed by `addi a0, a0, 0x123`, you need to understand that this is an `la` loading the address `PC + 0x123`. If the `addi` has the wrong offset, the `la` loaded the wrong address, and your BSS zeroing loop (or stack pointer) is wrong.
-
-2. **The stack setup.** If `la sp, stack_top` doesn't produce the right address, your stack pointer is wrong, and every subsequent function call is writing to the wrong memory. Verify with GDB: after the `la sp, stack_top` executes, check `info registers sp` and compare it with `objdump -t kernel.elf | grep stack_top`.
+</div>
+</details>
 
 ---
 
@@ -378,17 +401,14 @@ Why does this matter? Two reasons:
 
 We mentioned parking non-boot harts in Step 1. Let's think about this more carefully, because even though we're running with `-smp 1`, the logic reveals important concepts.
 
-### The Hart ID
+<details>
+<summary>Why use the `mhartid` CSR instead of `a0` to get the hart ID?</summary>
+<div>
 
-Each RISC-V [hart](https://en.wikipedia.org/wiki/Hardware_thread) (hardware thread) has a unique ID. On QEMU, harts are numbered starting from 0. The boot hart is typically hart 0, but the RISC-V specification doesn't mandate this — it's implementation-defined. On QEMU's `virt` machine, hart 0 is the boot hart.
+`a0` is a convention from QEMU/SBI — they pass the hart ID in `a0` at boot. But it's not hardware-guaranteed and could be clobbered. The `mhartid` CSR is read-only and always reflects the current hart's ID. Reading it via `csrr` is more robust — it's the hardware-guaranteed way.
 
-You can get the hart ID two ways:
-
-1. **From `a0` at boot.** When QEMU jumps to your kernel, `a0` contains the hart ID. This is a QEMU/SBI convention, not a hardware guarantee. If you use OpenSBI, `a0` will also contain the hart ID.
-
-2. **From the [`mhartid`](https://github.com/riscv/riscv-isa-manual/releases/download/Priv-v1.12/riscv-privileged-20211203.pdf) CSR.** This CSR is read-only and always contains the current hart's ID. This is the hardware-guaranteed way to get the hart ID. Reading `mhartid` is a `csrr` instruction.
-
-For robustness, use `mhartid` rather than relying on `a0` (which could be clobbered if something happens between the trampoline and your code).
+</div>
+</details>
 
 ### The Parking Loop
 

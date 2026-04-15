@@ -32,13 +32,14 @@ For Sv39, the canonical address ranges are:
 0xFFFF_FFFF_FFFF_FFFF ─┘
 ```
 
-### Why Higher-Half?
+<details>
+<summary>Why is the kernel mapped in every process's page table instead of having a separate kernel address space?</summary>
+<div>
 
-1. **The kernel is always mapped.** Every process's page table includes the kernel mappings. When a trap occurs, the CPU jumps to the trap handler — which is kernel code — without needing to switch page tables. If the kernel were in a separate address space, every trap would require a page table switch, which means a TLB flush, which means catastrophic performance.
+Every trap handler is kernel code. If the kernel were in a separate address space, every trap would require switching page tables and flushing the TLB—catastrophic performance. By mapping the kernel in every page table (with U=0), traps are fast. User programs see a clean lower-half address space starting at 0.
 
-2. **User space is clean.** User programs see a virtual address space starting at 0 (or a low address). They don't need to know about the kernel's layout. Every user program sees the same virtual address range for its code, data, and stack.
-
-3. **The separation is enforced by hardware.** Kernel pages have U=0 in their PTEs. Even though the kernel is mapped in every process's page table, user code can't access kernel memory — the U bit prevents it.
+</div>
+</details>
 
 ### The Kernel's Virtual Memory Layout
 
@@ -56,11 +57,16 @@ Virtual Address                  Maps To              Purpose
 (higher addresses)                                    Kernel heap, stacks, etc.
 ```
 
+<details>
+<summary>Why use a direct map of all physical memory instead of mapping pages on-demand?</summary>
+<div>
+
+A direct map lets the kernel trivially convert between physical and virtual addresses (just add/subtract KERNEL_BASE)—no page table walk needed. This is essential for reading/writing page tables (stored in physical RAM) and accessing MMIO. Linux, xv6, and most Unix kernels use this design.
+
+</div>
+</details>
+
 The simplest approach: **direct-map all of physical memory** at a fixed offset. Physical address P is mapped to virtual address `P + KERNEL_BASE`, where `KERNEL_BASE = 0xFFFFFFC000000000`. This is called a **[direct map](https://en.wikipedia.org/wiki/Memory_management_unit#Virtual_memory)** or **linear map**.
-
-The direct map has a beautiful property: converting between physical and virtual addresses is trivial arithmetic. `pa_to_va(pa) = pa + KERNEL_BASE`. `va_to_pa(va) = va - KERNEL_BASE`. No page table walk needed for the conversion — just addition or subtraction.
-
-This is how Linux, xv6, and most Unix kernels handle the kernel's mapping of physical memory. The kernel can access any physical address through its direct map, which is essential for reading and writing page tables (which are stored in physical memory) and for accessing device MMIO regions.
 
 > **Aside: KASLR — Kernel Address Space Layout Randomization**
 >
@@ -78,7 +84,16 @@ Here's the chicken-and-egg problem of enabling the MMU:
 4. But `pc` still contains a *physical* address (around `0x80000000`).
 5. If your page table only maps the kernel at the high virtual address, the instruction fetch at the old `pc` will page fault.
 
-**Solution: During the transition, include an [identity map](https://en.wikipedia.org/wiki/Memory_management_unit#Identity_mapping).** An identity map maps virtual address V to physical address V (same address). If you identity-map the kernel's physical address range, then the old `pc` (physical address) is also valid as a virtual address.
+<details>
+<summary>How do you safely enable the MMU when `pc` is still a physical address?</summary>
+<div>
+
+Include an **[identity map](https://en.wikipedia.org/wiki/Memory_management_unit#Identity_mapping)** that maps VA `0x80000000` → PA `0x80000000`. When you write `satp`, the old `pc` (physical address) is still valid as a virtual address. Then jump to the higher-half mapping, and remove the identity map. This "trampoline" bridges the transition from physical to virtual addressing.
+
+</div>
+</details>
+
+**Solution: During the transition, include an identity map.** An identity map maps virtual address V to physical address V (same address). If you identity-map the kernel's physical address range, then the old `pc` (physical address) is also valid as a virtual address.
 
 The transition sequence:
 
@@ -100,8 +115,6 @@ The transition sequence:
    - Now that `pc` is in the higher-half, the identity map is no longer needed.
    - Clear the identity map PTEs and flush the TLB.
 
-This is the **trampoline** technique: the identity map is a temporary bridge that lets you cross from physical addressing to virtual addressing.
-
 ### The Trampoline Page (xv6 approach)
 
 xv6 uses a slightly different approach: it maps a single "trampoline" page at the very top of the address space. This page contains the trap entry/exit code. When a trap occurs, the hardware jumps to the trampoline's virtual address (which is mapped in every page table), and the trampoline code switches to the kernel's page table and address space.
@@ -113,6 +126,15 @@ For our OS, the full identity map during the transition is simpler to understand
 ## The M-mode to S-mode Transition
 
 We've been running in M-mode. To use virtual memory, we need to be in S-mode (because `satp` only affects S-mode and U-mode address translation). Now is the time to make the transition.
+
+<details>
+<summary>Why must you configure PMP before transitioning to S-mode?</summary>
+<div>
+
+PMP (Physical Memory Protection) restricts what S-mode can access. Without at least one PMP entry allowing S-mode access, the first memory access after the transition fails. Configure PMP to allow S-mode full access before executing `mret`.
+
+</div>
+</details>
 
 The transition sequence:
 

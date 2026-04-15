@@ -29,13 +29,23 @@ In Chapter 1, we mentioned that RISC-V uses [memory-mapped I/O](https://en.wikip
 
 The UART on the QEMU `virt` machine has its registers starting at physical address `0x10000000`. This doesn't mean there's RAM at `0x10000000`. The memory controller recognizes that address range and routes reads and writes to the UART hardware (or, on QEMU, to the UART simulation logic) instead of to the DRAM controller.
 
-When you execute a store instruction to address `0x10000000`, the CPU puts `0x10000000` on the address bus and the data byte on the data bus. The memory interconnect looks at the address and says, "that's in the UART region," and routes the transaction to the UART device. The UART receives the byte and transmits it out the serial line. On QEMU, "transmitting it out the serial line" means putting the character into a buffer that your terminal reads.
+<details>
+<summary>How does the CPU distinguish between stores to RAM and stores to MMIO devices?</summary>
+<div>
 
-When you execute a load from `0x10000000`, the interconnect routes the read to the UART, and the UART responds with whatever data is in its receive buffer (a character you typed on your keyboard, or 0 if nothing is available).
+It doesn't — the CPU just puts an address and data on the bus. The memory interconnect decodes the address and routes it: if it's in the RAM range, it goes to the DRAM controller; if it's in a device range like `0x10000000`, it goes to the UART. From the CPU's perspective, a store to a UART register is identical to a store to RAM. This is the elegance of MMIO — no special instructions, just load/store to magic addresses.
 
-This is identical to how a normal memory load/store works from the CPU's perspective. The CPU doesn't know — or care — whether it's talking to RAM or a device. The addressing logic makes the routing decision. This is the beauty and simplicity of [MMIO](https://wiki.osdev.org/Memory_Mapped_IO): no special instructions needed, just regular loads and stores to special addresses.
+</div>
+</details>
 
-The critical difference from RAM: **device registers have side effects.** Reading from RAM returns the same value every time (until you write something new). Reading from the UART's data register *consumes* the character — the next read returns the next character, or nothing if the buffer is empty. Writing to RAM just stores a value. Writing to the UART's data register *transmits* a character — it causes something to happen in the physical world (or the simulated world). This is why [`volatile`](https://en.wikipedia.org/wiki/Volatile_(computer_programming)) is mandatory for MMIO: the compiler must not optimize away reads (because each read has a different result) or writes (because each write has a side effect).
+<details>
+<summary>Why is `volatile` mandatory for MMIO but not for RAM?</summary>
+<div>
+
+RAM reads return the same value (until you write new data), so the compiler can cache them. MMIO registers have side effects: reading UART data *consumes* the character, and writing UART data *transmits* it. Without `volatile`, the compiler might optimize away repeated reads/writes or reorder them. `volatile` tells the compiler: this memory has invisible side effects, don't optimize.
+
+</div>
+</details>
 
 > **Aside: Port-mapped I/O on x86**
 >
@@ -68,9 +78,14 @@ Offset  Name (read)        Name (write)       Description
 0x07    SCR                SCR                Scratch Register
 ```
 
-Notice something unusual: **offset 0x00 is two different registers depending on whether you read or write.** Reading offset 0x00 gives you the **Receive Buffer Register (RBR)** — the next character received from the serial line. Writing offset 0x00 goes to the **Transmit Holding Register (THR)** — the character to send. Same address, different behavior for read vs. write. This is common in hardware — it saves address space by overloading addresses based on access type.
+<details>
+<summary>How can one address be two different registers?</summary>
+<div>
 
-Similarly, offset 0x02 is the Interrupt Identification Register (IIR) when read, and the FIFO Control Register (FCR) when written.
+Offset 0x00: reading gives RBR (receive buffer), writing goes to THR (transmit). Same physical address, different behavior based on read vs. write. This saves address space — hardware decodes the bus signal to distinguish load from store. Similarly, 0x02 is IIR when read, FCR when written. This pattern appears throughout hardware.
+
+</div>
+</details>
 
 Let's go through the registers we actually need:
 
@@ -78,11 +93,25 @@ Let's go through the registers we actually need:
 
 Write a byte here to transmit it. The UART serializes the byte and sends it out. On QEMU, the character appears in your terminal. Simple as that — write a byte, it shows up on screen.
 
-But there's a catch: the UART can only transmit so fast. If you write a second byte before the first one has been sent, the second byte might be dropped. You need to check that the UART is ready before writing.
+<details>
+<summary>What happens if you write to THR without checking if the UART is ready?</summary>
+<div>
+
+The UART can only transmit so fast. Writing a second byte before the first completes might cause the second byte to be dropped or corrupted. You must check the THRE bit in LSR before writing to ensure the transmit holding register is empty.
+
+</div>
+</details>
 
 ### RBR — Receive Buffer Register (Read, Offset 0x00)
 
-Read a byte from here to receive a character. On QEMU, this is a character the user typed. If no character is available, reading this register gives you... well, on the real chip, it gives you the last received character (or garbage). You need to check the Line Status Register to know if a new character is actually available.
+<details>
+<summary>What happens if you read RBR when no character is available?</summary>
+<div>
+
+On the real chip, you get the last received character (or garbage). On QEMU, you get whatever's in the buffer. You must check the Data Ready bit in LSR to know if new data actually arrived. Reading RBR without checking LSR gives stale or garbage data.
+
+</div>
+</details>
 
 ### LSR — Line Status Register (Read, Offset 0x05)
 
@@ -123,7 +152,14 @@ Bit 2: Receiver Line Status Interrupt Enable
 Bit 3: Modem Status Interrupt Enable
 ```
 
-For now, we'll use **polling** (checking the status register in a loop) rather than interrupts. We haven't built a trap handler yet (that's Chapter 7). Later, we'll enable UART interrupts so the kernel can be notified when input arrives instead of constantly polling.
+<details>
+<summary>Why poll instead of using UART interrupts now?</summary>
+<div>
+
+Polling means busy-waiting on LSR in a loop. It's wasteful of CPU cycles but simple and doesn't require a trap handler. Interrupts would notify the kernel when data arrives, freeing the CPU to do other work. But interrupts require trap infrastructure (Chapter 7), which we don't have yet. We'll upgrade to interrupts later.
+
+</div>
+</details>
 
 ### LCR — Line Control Register (Read/Write, Offset 0x03)
 
@@ -224,20 +260,25 @@ The order matters. You set the baud rate before enabling FIFOs because some hard
 
 ## Writing a Character
 
-The fundamental operation: put one byte on the screen. The function conceptually does:
+<details>
+<summary>Why is busy-waiting wasteful, and when is it acceptable?</summary>
+<div>
 
-1. Read LSR in a loop until bit 5 (THRE) is set, indicating the transmit holding register is empty.
-2. Write the character byte to THR (offset 0x00).
+Busy-waiting spins the CPU in a tight loop, burning cycles reading LSR until THRE is set. This wastes power and CPU time. On a real system with many processes, you'd want interrupt-driven I/O. But at this stage — early kernel development, single-threaded — simplicity matters more than efficiency. Once you have a scheduler and meaningful work to do during I/O waits, you'll switch to interrupts.
 
-The loop in step 1 is called **busy-waiting** or **polling**. The CPU sits in a tight loop, reading the status register over and over until the device is ready. This is wasteful — the CPU is burning cycles doing nothing useful. But it's simple, it works, and at this stage of development, simplicity trumps everything.
+</div>
+</details>
 
 Later, when you have interrupts (Chapter 7), you can switch to interrupt-driven I/O: instead of polling LSR, you enable the THRE interrupt, write a character, and then go do other work. When the UART is ready for the next character, it generates an interrupt, and your interrupt handler sends the next byte. This frees the CPU from busy-waiting. But that requires infrastructure we don't have yet.
 
-### How Fast Is This?
+<details>
+<summary>How does UART transmission speed differ on QEMU vs. real hardware?</summary>
+<div>
 
-On QEMU, effectively instant. The emulated UART doesn't simulate transmission delays — when you write to THR, the character is immediately available on the host terminal. LSR bit 5 is always set by the time you check it. Your busy-wait loop executes zero times on QEMU.
+On QEMU, transmission is instant — characters appear immediately. The busy-wait loop executes zero times. On real hardware at 115200 baud, each character takes about 87 microseconds. A long string means significant CPU wait time. At 9600 baud, it's a millisecond per character. This is why real systems use interrupt-driven I/O — but on QEMU, polling is fine for development.
 
-On real hardware at 115200 baud (a common modern serial speed), each character takes about 87 microseconds to transmit (10 bits per character at 115200 bits/second). If you're printing a long string, the CPU spends significant time waiting. At 9600 baud (an older standard), each character takes about a millisecond. This is why interrupt-driven I/O matters on real hardware — but for QEMU development, polling is fine.
+</div>
+</details>
 
 ---
 
@@ -298,7 +339,14 @@ The trickiest part of `kprintf` is converting integers to strings. For `%d` and 
 2. Divide by 10 in a loop, storing each remainder as a digit character (`'0' + remainder`). Stop when the quotient is zero.
 3. You've accumulated digits in reverse order. Either reverse them, or store them in a buffer starting from the end and work backward.
 
-**Hexadecimal conversion:** Simpler. Shift right by 4 bits and mask with 0xF, repeatedly, to extract each nibble. Convert each nibble to `'0'–'9'` or `'a'–'f'`. A 64-bit value has at most 16 hex digits.
+<details>
+<summary>How do you extract hex digits without dividing?</summary>
+<div>
+
+Shift right by 4 bits and mask with 0xF to extract each nibble (4 bits). Repeat 16 times for a 64-bit value. Convert each 4-bit value to a character: 0-9 stays as `'0'–'9'`, 10-15 becomes `'a'–'f'`. Much simpler than decimal division.
+
+</div>
+</details>
 
 **Pointer (`%p`):** Print `0x` followed by the pointer value in hex. A `uintptr_t` is 64 bits on RV64, so you'll print up to 16 hex digits.
 
@@ -346,9 +394,14 @@ Hello
           Foo
 ```
 
-To get proper line breaks on a raw serial connection, you need to send both `\r` (carriage return, CR, byte `0x0D`) and `\n` (line feed, LF). Your `uart_putc` (or `kprintf`) should intercept `\n` and automatically send `\r\n` instead. This is a small detail that will save you frustration.
+To get proper line breaks on a raw serial connection, you need to send both `\r` (carriage return, CR, byte `0x0D`) and `\n` (line feed, LF). <details>
+<summary>Why send `\r\n` instead of just `\n`?</summary>
+<div>
 
-QEMU's `-nographic` mode connects to your terminal emulator, which typically handles `\n` correctly (your terminal interprets LF as "new line," including the carriage return). But it's good practice to send `\r\n`, and on real hardware, it's often necessary.
+Unix uses `\n` alone, but raw serial terminals need both CR (carriage return, move to column 0) and LF (line feed, advance one line). Without `\r`, output looks like a staircase on real hardware. QEMU's terminal emulator tolerates bare `\n`, but it's good practice to send `\r\n` — it works everywhere and avoids surprises on real hardware.
+
+</div>
+</details>
 
 > **Aside: The history of CR and LF**
 >
@@ -368,15 +421,14 @@ The advantage: instead of writing to `*(volatile uint8_t *)(UART_BASE + 0x05)` e
 
 The struct needs to be 8 bytes total (8 registers × 1 byte each), with fields at the correct offsets. Since all fields are `uint8_t` (1 byte), there's no alignment padding to worry about. The struct's natural layout matches the hardware register layout exactly.
 
-One subtlety: offset 0x00 is THR when written and RBR when read. In C, a struct field is a single entity — you can't have it behave differently for read and write. Options:
+<details>
+<summary>How do you represent offset 0x00 (THR/RBR) in a struct?</summary>
+<div>
 
-1. **Use a single field name** (like `data`) for offset 0x00. Reading it gives RBR, writing it writes THR. The C code won't distinguish them, but the hardware does. This works fine — just document it.
+Option 1: Use a single field name (`data`). Reads return RBR, writes go to THR. The hardware handles it; the C code just uses one field. Option 2: Use a union with `thr` and `rbr`. More explicit but adds complexity. Option 3: Skip the struct, use constants and helper functions (what xv6 does). Pick based on readability vs. simplicity. All work.
 
-2. **Use a union** at offset 0x00 with `thr` and `rbr` names. This is more explicit but adds complexity for no real benefit.
-
-3. **Don't use a struct overlay.** Just define constants for the offsets and write helper functions. This is simpler and what xv6 does.
-
-Any of these approaches works. Choose based on your preference for readability vs. simplicity.
+</div>
+</details>
 
 ---
 

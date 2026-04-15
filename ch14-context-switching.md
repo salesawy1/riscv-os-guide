@@ -128,23 +128,36 @@ context_switch:
     ret
 ```
 
-That's it. About 28 instructions. After `ret`, execution continues at whatever address was in the new context's `ra` — which is wherever the new process last called `context_switch`. And `sp` now points to the new process's kernel stack.
+<details>
+<summary>What happens after the ret instruction? Where does execution go?</summary>
+<div>
 
-The magic is in what `ret` does here. `ret` is `jalr x0, 0(ra)` — jump to the address in `ra`. We just loaded `ra` from the *new* process's context. So `ret` doesn't return to our caller — it returns to the *new process's* caller. We've teleported from one kernel execution context to another.
+After `ret`, execution continues at whatever address was in the new context's `ra` — which is wherever the new process last called `context_switch`. And `sp` now points to the new process's kernel stack. So the new process resumes exactly where it left off, on its own stack, as if the context switch never happened.
+
+</div>
+</details>
+
+That's it. About 28 instructions.
+
+<details>
+<summary>How does ret 'teleport' from one process's context to another?</summary>
+<div>
+
+`ret` is the instruction `jalr x0, 0(ra)` — it jumps to whatever address is in the `ra` register. Just before executing `ret`, we loaded `ra` from the new process's context. So `ret` doesn't jump back to the original caller — it jumps to the new process's previous caller. Execution continues wherever the new process last was in the kernel, making it look like the new process never left. We've switched execution contexts by changing where we return to.
+
+</div>
+</details>
 
 ### Why Only Callee-Saved Registers?
 
-Because `context_switch` is called as a regular C function. The C calling convention guarantees:
-- The caller has already saved any caller-saved registers it needs.
-- The callee (`context_switch`) must preserve callee-saved registers.
+<details>
+<summary>Why does context_switch only save callee-saved registers, not all 31?</summary>
+<div>
 
-By saving and restoring the callee-saved registers, `context_switch` maintains the illusion for both the old and new processes that a normal function call occurred. When process B resumes, it returns from `context_switch` and finds all its callee-saved registers intact, exactly as the calling convention promises.
+Because `context_switch` is called as a regular C function. The C calling convention guarantees that the caller has already saved any caller-saved registers it needs before calling the function. The callee only needs to preserve callee-saved registers. By saving only `ra`, `sp`, and `s0`–`s11`, `context_switch` maintains the illusion for both processes that a normal function call occurred. When process B resumes and returns from `context_switch`, it finds all the registers it expects to be preserved — exactly as the calling convention promises.
 
-> **Aside: Why not just save all registers?**
->
-> You could save all 31 registers in the context, but it would be wasteful. The caller-saved registers are, by definition, registers the calling code doesn't expect to be preserved. The code that called `context_switch` (the scheduler, running as kernel code) already saved any caller-saved registers it needed on the stack before making the call. Saving them again in the context struct would be redundant.
->
-> xv6's `swtch()` function saves exactly the same set we do: `ra`, `sp`, `s0`–`s11`. Study it — it's about 30 lines of assembly.
+</div>
+</details>
 
 ---
 
@@ -157,11 +170,14 @@ Context switching also requires switching the [page table](https://en.wikipedia.
 3. Flush the TLB (`sfence.vma`)
 4. Restore B's registers
 
-Where in the sequence should the `satp` switch happen? There are two approaches:
+<details>
+<summary>When should the satp switch happen — before, after, or during the register save/restore?</summary>
+<div>
 
-**Approach 1: Switch in the scheduler.** Before calling `context_switch`, the scheduler changes `satp`. Since the kernel is mapped identically in all page tables, the kernel code continues to execute correctly — only the user mappings change.
+There are two approaches. Approach 1: Switch in the scheduler before calling `context_switch`. Since the kernel is mapped identically in all page tables, the kernel code continues to execute correctly — only the user mappings change. This is safe and simple. Approach 2: Switch inside `context_switch` assembly between the save and restore. This requires the assembly code itself to be mapped in both page tables, which it is (shared kernel mapping), but it's more complex. Approach 1 is simpler and is what xv6 does.
 
-**Approach 2: Switch inside `context_switch`.** The `context_switch` assembly writes `satp` between the save and restore. This is trickier because the assembly itself must be mapped in both page tables (which it is, since it's kernel code in the shared kernel mapping).
+</div>
+</details>
 
 Approach 1 is simpler and is what xv6 does. The scheduler function:
 
@@ -190,6 +206,15 @@ void scheduler(void) {
 ## The Scheduler Loop
 
 The [scheduler](https://en.wikipedia.org/wiki/Scheduling_(computing)) is a special kernel execution context. It has its own stack and its own `struct context`. It doesn't represent a user process — it's the kernel's "idle/dispatch" loop.
+
+<details>
+<summary>Why is the scheduler a separate execution context with its own stack? Why can't it just run on the current process's kernel stack?</summary>
+<div>
+
+Because the scheduler must survive across many process switches. If the scheduler ran on the current process's kernel stack, when switching to the next process, we'd be switching to that process's kernel stack — and the scheduler's state would be lost. By having its own dedicated stack, the scheduler can switch to any process via `context_switch`, and when that process yields, the scheduler's previous context is restored perfectly. The scheduler is both the caller and the persistent "parking spot" between process runs.
+
+</div>
+</details>
 
 The scheduler loop:
 1. Find a READY process

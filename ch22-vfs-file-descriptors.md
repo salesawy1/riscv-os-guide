@@ -36,6 +36,15 @@ Process A:
   ...
 ```
 
+<details>
+<summary>Why are file descriptors represented as small integers instead of pointers to open file structures?</summary>
+<div>
+
+Stability and abstraction. If a user program held a pointer directly to an open file structure, moving that structure in memory (for defragmentation, garbage collection, or relocation) would break the pointer. An integer index is stable — it refers to a slot in the per-process table, which the kernel can manage. The user never sees the actual structure; they only know a small number. It also limits what a user program can do: they can't bypass the kernel by manipulating file structure pointers.
+
+</div>
+</details>
+
 `open()` finds the lowest unused fd slot, creates an open file struct, and stores a pointer in the slot. `close()` sets the slot to NULL.
 
 ### The Open File Structure
@@ -55,6 +64,15 @@ struct file {
 ```
 
 The **reference count** tracks how many file descriptors point to this struct. When `fork()` creates a child, the child inherits the parent's file descriptors — both point to the same open file structs, so the reference count increases. `close()` decrements the count; when it reaches 0, the struct is freed.
+
+<details>
+<summary>Why is the offset stored in the open file struct instead of in the fd table?</summary>
+<div>
+
+The offset represents the kernel's bookkeeping for where you are in a file — it must be shared by all file descriptors that refer to the same underlying open file. If the offset were in the fd table, then parent and child after `fork()` would each have their own offset even though they're reading from the same open file. This would be surprising and error-prone. Storing it in the shared open file struct ensures they truly share the file position.
+
+</div>
+</details>
 
 The **offset** is the current position in the file. `read()` advances it. `lseek()` changes it. Because the offset is in the open file struct (not in the fd table), multiple processes sharing the same open file (e.g., parent and child after fork) share the same offset. Writing from the parent advances the offset for the child too.
 
@@ -86,6 +104,15 @@ The **offset** is the current position in the file. `read()` advances it. `lseek
 ## The VFS Concept
 
 Not everything is a file on disk. The console (UART) is a "file" you can read from and write to. Pipes are "files." In the future, network sockets would be "files." The **[Virtual Filesystem](https://en.wikipedia.org/wiki/Virtual_file_system)** (VFS) layer provides a uniform interface: every file-like thing supports `read`, `write`, and `close`, regardless of what's behind it.
+
+<details>
+<summary>Why does the VFS abstract both disk files and devices (like UART) into the same interface?</summary>
+<div>
+
+Uniformity simplifies user programs and the system call interface. A program using `read()` doesn't care whether it's reading from a file or the console — it just calls `read()` with a file descriptor. The kernel's dispatcher handles the difference. Without this abstraction, you'd need separate system calls for files, devices, pipes, etc., and user programs would need to know what type of thing a file descriptor refers to. VFS makes the system more elegant and user programs more generic.
+
+</div>
+</details>
 
 The VFS uses function pointers (or a type field with a switch statement) to dispatch operations to the right implementation:
 
@@ -128,6 +155,15 @@ This is why `printf` works: the user program's `printf` calls `write(1, formatte
 5. Store the file pointer in that slot
 6. Return the fd number
 
+<details>
+<summary>Why does `open()` return the lowest available file descriptor number?</summary>
+<div>
+
+This is the key to shell I/O redirection. If you know that `open()` will always return the smallest unused fd, you can close fd 1 (stdout) and then open a file — it will be assigned fd 1. Now stdout is redirected. Without this guarantee, you'd have no way to predictably redirect I/O. The convention is so fundamental to Unix that all systems honor it.
+
+</div>
+</details>
+
 ### read(fd, buf, n)
 
 1. Look up `fd` in the process's fd table to get the `struct file`
@@ -137,9 +173,27 @@ This is why `printf` works: the user program's `printf` calls `write(1, formatte
 5. Advance `f->offset` by the number of bytes read
 6. Return the number of bytes read
 
+<details>
+<summary>Why does `read()` copy into a kernel buffer before copying to user space?</summary>
+<div>
+
+User pointers are untrusted — they might not actually be valid user memory. The file_read functions are written assuming they're operating on kernel buffers. By reading into a kernel buffer first, you isolate the filesystem code from user-space validation details. You validate the user buffer once (with copyin/copyout), then the kernel code never has to worry about it again.
+
+</div>
+</details>
+
 ### write(fd, buf, n)
 
 Similar to read, but writing. For FD_INODE, this requires implementing `inode_write_data()` — allocating new blocks if the file grows, updating the inode's size.
+
+<details>
+<summary>Why must `write()` allocate new blocks if the file grows?</summary>
+<div>
+
+Blocks don't magically exist. When you write beyond a file's current size, the filesystem must allocate new data blocks, update the inode to point to them, and mark them as allocated in the free bitmap. Otherwise, writing would overwrite whatever data happens to be in those blocks on disk, corrupting other files.
+
+</div>
+</details>
 
 ### close(fd)
 
@@ -147,6 +201,15 @@ Similar to read, but writing. For FD_INODE, this requires implementing `inode_wr
 2. Set the fd table slot to NULL
 3. Decrement the file's reference count
 4. If ref count reaches 0, free the file struct (and release the inode if FD_INODE)
+
+<details>
+<summary>Why does `close()` decrement a reference count instead of immediately freeing the file?</summary>
+<div>
+
+After `fork()`, both parent and child have file descriptors pointing to the same open file struct. If the parent closes fd 3, that shouldn't close the file for the child — the child still has its own reference. By decrementing the reference count, you only free the struct when the *last* file descriptor referencing it is closed. This is essential for fork/exec to work correctly.
+
+</div>
+</details>
 
 ---
 

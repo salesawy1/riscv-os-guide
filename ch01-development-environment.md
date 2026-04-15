@@ -18,7 +18,14 @@ Here's the thing that trips up most people starting OS development: **you are no
 
 ### What Problem It Solves
 
-You're sitting at your Mac or Linux machine, which runs on x86-64 or ARM. You want to produce binaries that run on RISC-V 64-bit hardware. Your system's default compiler — the one invoked when you type `gcc` or `clang` — produces binaries for your *host* architecture. If you compile your kernel with your host compiler, you'll get a binary that your host CPU can execute, but a RISC-V CPU will look at it like a novel written in a language it doesn't speak.
+<details>
+<summary>Why can't you just use your system's gcc to compile kernel code for RISC-V?</summary>
+<div>
+
+Your system's gcc produces binaries for your *host* architecture (x86-64 or ARM). A RISC-V CPU can't execute those binaries — it's a completely different instruction set. You need a compiler that runs on your host but produces RISC-V machine code.
+
+</div>
+</details>
 
 A **[cross-compiler](https://wiki.osdev.org/Cross-Compiler)** is a compiler that runs on one architecture (the *host*) but produces code for a different architecture (the *target*). This is not exotic — it's how virtually all embedded and OS development works. The Android NDK is a cross-compiler. When Apple builds iOS apps on a Mac, that's cross-compilation. You need one too.
 
@@ -69,11 +76,18 @@ If this produces version output without errors, you're in business.
 
 ### The `-ffreestanding` Flag
 
-When you compile your kernel, you'll pass `-ffreestanding` to the compiler. This is one of the most important flags in OS development, and it does two things:
+When you compile your kernel, you'll pass `-ffreestanding` to the compiler. This flag tells the compiler to not assume the standard library is available.
 
-1. **It tells the compiler not to assume the standard library is available.** Normally, GCC knows that `memcpy` exists and may silently generate calls to it as an optimization — for instance, when you assign one struct to another. With `-ffreestanding`, the compiler *still might do this*, but it's telling you: "I know you might not have libc, so you're responsible for providing these functions if I need them." In practice, you'll need to implement `memcpy`, `memset`, and `memmove` early on, because the compiler will generate calls to them whether you like it or not.
+<details>
+<summary>Why does the compiler still generate calls to memcpy even with -ffreestanding?</summary>
+<div>
 
-2. **It tells the compiler that `main()` is not necessarily the entry point.** In a hosted environment, the C runtime starts at `_start`, sets up the stack, initializes global constructors, and calls `main()`. In a freestanding environment, none of that exists. Your entry point is wherever your linker script says it is.
+With `-ffreestanding`, the compiler *still* reserves the right to generate calls to `memcpy`, `memset`, and `memmove` as optimizations (e.g., for struct assignment or large array initialization). The flag tells the compiler you *might not* have libc — but it's on you to provide these functions if the compiler needs them. If you don't, you'll get linker errors from code the compiler generated behind your back.
+
+</div>
+</details>
+
+Additionally, `-ffreestanding` tells the compiler that `main()` is not necessarily the entry point. In a hosted environment, the C runtime starts at `_start`, sets up the stack, initializes global constructors, and calls `main()`. In a freestanding environment, your entry point is wherever your linker script says it is.
 
 Other critical compiler flags you'll use:
 
@@ -89,13 +103,14 @@ Other critical compiler flags you'll use:
 
 ### What Problem It Solves
 
-You could, in theory, buy a RISC-V development board (the SiFive HiFive Unmatched, the StarFive VisionFive 2) and test your OS on real hardware. This would be a terrible idea at this stage, for several reasons:
+<details>
+<summary>Why use an emulator instead of real RISC-V hardware?</summary>
+<div>
 
-1. **Debugging on real hardware is agonizing.** Your only feedback mechanism is an LED or a serial port. There's no `printf` until you build one. There are no breakpoints. When your kernel crashes, the board just... sits there.
+Real hardware boards only provide an LED or serial port for feedback — there's no debugger, no breakpoints, and no way to inspect machine state. Real hardware also has board-specific quirks in firmware, boot sequences, and device trees. You'd spend weeks debugging hardware issues instead of learning OS concepts. QEMU, by contrast, boots in under a second and provides GDB integration for full debugging.
 
-2. **Real hardware has real firmware with real quirks.** Every board has its own boot sequence, its own device tree, its own set of peripherals. You'd spend weeks fighting hardware-specific issues instead of learning OS concepts.
-
-3. **Iteration time matters.** On real hardware, you flash an SD card, power cycle the board, wait for it to boot, see it crash, and repeat. With QEMU, the cycle is: save the file, run `make run`, see the result in under a second.
+</div>
+</details>
 
 QEMU is a full-system emulator. When you run `qemu-system-riscv64`, it simulates an entire RISC-V computer: CPU, RAM, interrupt controllers, serial ports, block devices, and more. The `virt` machine type is a QEMU-specific board designed specifically for OS development and testing — it has predictable device addresses, a clean device tree, and no firmware quirks to work around.
 
@@ -135,7 +150,16 @@ When you invoke QEMU with `-machine virt`, you get a simulated board with the fo
 
 These addresses are *memory-mapped*. There's no special I/O instruction on RISC-V (unlike x86 with its `in`/`out` instructions). To talk to the UART, you read and write to memory addresses starting at `0x10000000`. The hardware intercepts those reads and writes and routes them to the device. This is called **[memory-mapped I/O (MMIO)](https://wiki.osdev.org/Memory_Mapped_IO)**, and it's how most modern architectures handle device communication. We'll explore this thoroughly in Chapter 6.
 
-The key thing to know now is that your kernel's memory map is not just RAM. Some addresses are RAM, some are devices, and writing to the wrong address will either do nothing or cause a fault. The QEMU `virt` machine's memory map is documented in QEMU's source code (`hw/riscv/virt.c`), and we'll reference specific addresses as we encounter each device.
+<details>
+<summary>How does the CPU know which addresses are UART and which are RAM?</summary>
+<div>
+
+The CPU doesn't inherently know. When you issue a load or store to an address, the memory system (memory controller, MMU) routes it. For MMIO regions, the chipset intercepts the request and routes it to the device instead of RAM. This routing is configured by the platform — on QEMU, it's hardwired. You just need to know the correct addresses from the hardware specification.
+
+</div>
+</details>
+
+The QEMU `virt` machine's memory map is documented in QEMU's source code (`hw/riscv/virt.c`), and we'll reference specific addresses as we encounter each device.
 
 ### The QEMU Invocation You'll Use
 
@@ -207,14 +231,16 @@ To quit QEMU with `-nographic`, press `Ctrl-A, X`. (Not `Ctrl-C` — that sends 
 
 ### What Problem It Solves
 
-Your OS will consist of assembly files (`.S`), C source files (`.c`), and a linker script (`.ld`). The build process is:
+Your OS will consist of assembly files (`.S`), C source files (`.c`), and a linker script (`.ld`). The build process chains multiple tools together: assemble, compile, and link.
 
-1. Assemble `.S` files into `.o` object files
-2. Compile `.c` files into `.o` object files
-3. Link all `.o` files into a single ELF binary using the linker script
-4. (Optionally) convert the ELF to a raw binary image
+<details>
+<summary>Why not just run the compiler commands by hand each time?</summary>
+<div>
 
-You *could* type out these commands by hand every time. You'll stop doing that approximately 90 seconds into development. A Makefile automates this build process.
+You'll have dozens of source files, each with dependencies (headers). If you change a header, you need to recompile everything that includes it. Running this by hand is tedious and error-prone. A Makefile automates the process and lets you rebuild only what's necessary. With `make` and dependency tracking, you save minutes per iteration.
+
+</div>
+</details>
 
 ### A Makefile for OS Development
 
@@ -250,9 +276,18 @@ Let me walk you through what your Makefile needs to express, conceptually. You'l
 
 ### What Problem It Solves
 
-When you compile an application for Linux, the compiler and linker produce an ELF binary, and the OS's program loader decides where in memory to place it. The linker uses default scripts that put the `.text` section (code) at some address, `.data` (initialized global variables) at another, `.bss` ([uninitialized globals](https://wiki.osdev.org/Memory_Layout)) at another, and so on. The exact addresses don't matter much because the OS handles it.
+When you compile an application for Linux, the OS's program loader decides where to place the binary in memory at runtime. You don't have an OS.
 
-You don't have an OS. *You are the OS.* Nobody is going to load your binary and set up its memory layout. The QEMU `-kernel` flag loads your ELF into memory and jumps to its entry point, but *you* must tell the linker exactly where every section should go in the physical address space. This is what a linker script does.
+<details>
+<summary>Why do we need a linker script if the loader is supposed to place the binary?</summary>
+<div>
+
+QEMU's `-kernel` flag reads the ELF's program headers to find the entry point address. If your linker script doesn't explicitly place `.text` at `0x80000000` (where QEMU expects it), the ELF entry point will be wrong, QEMU will jump to the wrong address, and your kernel won't boot. You must be explicit about every section's physical location because there's no runtime loader to adjust it.
+
+</div>
+</details>
+
+The linker script is how you exercise that control — telling the linker exactly where every section should go in the physical address space.
 
 ### Why You Can't Skip This
 
@@ -285,11 +320,16 @@ The linker script defines output sections and maps input sections to them. A sim
 
 The order matters. `.text` comes first because the entry point must be at the base address. Each subsequent section follows the previous one in memory. The linker script uses the `.` (dot) symbol as the location counter — it advances as you place sections, and you can read it to record addresses.
 
-**What makes linker scripts unique in OS development:**
+<details>
+<summary>Why do you need to zero the BSS in assembly, not in C?</summary>
+<div>
 
-You'll use the linker script to export symbols that your C code reads. For example, you'll define a symbol `_bss_start` at the beginning of the `.bss` section and `_bss_end` at the end. Your boot code will use these symbols to zero out the BSS — because in a freestanding environment, nobody initializes your BSS for you. If you don't zero it, global variables that should be zero will contain whatever garbage was in RAM at boot.
+Global variables are stored in the `.bss` section, which starts with garbage RAM contents. If you write a C function to zero the BSS, that function itself might have local variables or read global variables — which are in the BSS and not yet zeroed. You'd be corrupting the very data you're trying to initialize. Assembly code has no implicit dependencies on uninitialized globals, so it can safely zero the BSS before C code runs.
 
-Similarly, you'll export symbols marking the end of the kernel image. These tell your memory allocator where free memory begins — you don't want to hand out memory that your kernel code is sitting in.
+</div>
+</details>
+
+You'll use the linker script to export symbols that your boot code reads. For example, `_bss_start` and `_bss_end` mark the BSS region so your assembly boot stub can zero it. Similarly, `_kernel_end` marks where the kernel image ends, telling your memory allocator where free memory begins.
 
 You'll also use `ALIGN()` directives to ensure sections start at page-aligned boundaries. When we get to virtual memory (Chapter 10), you'll need code and data to be on page boundaries so you can set different permissions on them (executable but not writable for `.text`, writable but not executable for `.data`). Setting this up in the linker script now saves pain later.
 
@@ -304,11 +344,14 @@ You'll also use `ALIGN()` directives to ensure sections start at page-aligned bo
 >
 > The xv6 linker script (`kernel.ld`) is about 30 lines and is a good model. Look at it after you've written yours.
 
-### The BSS: A Section That Matters More Than You Think
+<details>
+<summary>What happens if you forget to zero the BSS?</summary>
+<div>
 
-One thing that catches new OS developers: the [`.bss` section](https://wiki.osdev.org/Memory_Layout). In a normal C program, the OS loader zeroes the BSS before `main()` runs, so uninitialized global variables start at zero as the C standard guarantees. In your kernel, *you* must zero it yourself. Your boot assembly stub, after setting up the stack and before calling `kernel_main()`, should loop from `_bss_start` to `_bss_end` and write zeros. If you skip this, you'll get mysterious bugs where global variables have unpredictable initial values.
+Uninitialized global variables will contain whatever garbage was in RAM at boot time. This leads to mysteriously incorrect behavior: a flag that should be false but isn't, a counter that starts with a random number, a pointer that points to nowhere. The bugs are hard to reproduce and harder to find, because they depend on what happened to be in RAM. You'll waste hours debugging. Always zero the BSS in your boot stub.
 
-This is the kind of thing that "just works" in application programming and silently fails in OS development. You'll encounter many of these. Each one teaches you something that was previously invisible about how programs work.
+</div>
+</details>
 
 ---
 

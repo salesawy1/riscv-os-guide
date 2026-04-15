@@ -38,12 +38,25 @@ Each program header describes a **segment** — a contiguous chunk of the file t
 - **`p_memsz`**: Size of the segment in memory (may be larger than `p_filesz` — the extra bytes are zeroed, which is how [BSS](https://en.wikipedia.org/wiki/.bss) works)
 - **`p_flags`**: Permission flags: `PF_R` (readable), `PF_W` (writable), `PF_X` (executable)
 
+<details>
+<summary>Why does an ELF have separate text and data segments?</summary>
+<div>
+
 A typical user program has two `[PT_LOAD](https://refspecs.linuxfoundation.org/elf/elf.pdf)` segments:
 
 1. **Text segment**: Read + Execute. Contains the program's code. `p_filesz == p_memsz` (all data comes from the file).
 2. **Data segment**: Read + Write. Contains initialized data (`.data`) and uninitialized data ([`.bss`](https://en.wikipedia.org/wiki/.bss)). `p_memsz > p_filesz` because BSS occupies memory but has no data in the file (the difference is zeroed).
 
+Separating these allows the kernel to map the text segment as read-only and executable, protecting code from accidental or malicious modification. The data segment is writable so the program can modify global and static variables at runtime.
+
+</div>
+</details>
+
 ### Loading Algorithm
+
+<details>
+<summary>Why zero the bytes between filesz and memsz?</summary>
+<div>
 
 For each `[PT_LOAD](https://refspecs.linuxfoundation.org/elf/elf.pdf)` segment:
 
@@ -52,7 +65,12 @@ For each `[PT_LOAD](https://refspecs.linuxfoundation.org/elf/elf.pdf)` segment:
 3. Copy `p_filesz` bytes from the ELF file at offset `p_offset` into the mapped memory at `p_vaddr`
 4. Zero the remaining `p_memsz - p_filesz` bytes (this covers BSS)
 
+This zeroing is essential because BSS (uninitialized global and static data) must start at zero. The compiler doesn't include actual zeros in the ELF file to save space — it just specifies the size. The kernel must explicitly zero this memory when loading.
+
 After loading all segments, set the process's entry point to `e_entry` and the program break to the end of the last segment (rounded up to page boundary).
+
+</div>
+</details>
 
 ---
 
@@ -78,7 +96,9 @@ After loading all segments, set the process's entry point to `e_entry` and the p
 
 8. **Return to user mode.** The process now runs the new program.
 
-### Where Do the ELF Files Come From?
+<details>
+<summary>How can we load user programs without a filesystem?</summary>
+<div>
 
 We don't have a filesystem yet (that's Chapters 20-22). For now, you have several options:
 
@@ -89,6 +109,9 @@ We don't have a filesystem yet (that's Chapters 20-22). For now, you have severa
 **Option C: Build a simple ramdisk.** Concatenate multiple user programs into a single binary with a header that describes each program's offset and size. Link it into the kernel or load it via `-initrd`.
 
 Option A is the simplest for testing. It's what [xv6](https://github.com/mit-pdos/xv6-riscv) does (via `mkfs` — it builds a filesystem image, but the concept is similar).
+
+</div>
+</details>
 
 > **Aside: Argument passing on the stack**
 >
@@ -106,7 +129,9 @@ Option A is the simplest for testing. It's what [xv6](https://github.com/mit-pdo
 
 ---
 
-## Validation and Safety
+<details>
+<summary>Why must exec fail safely without destroying the current process?</summary>
+<div>
 
 `exec()` operates on untrusted input (the ELF file could be malicious or corrupted). Validate everything:
 
@@ -119,6 +144,9 @@ Option A is the simplest for testing. It's what [xv6](https://github.com/mit-pdo
 If any validation fails, `exec()` should fail and return -1 (without destroying the current process). The current process continues running its old program. This error recovery is important — a failed `exec()` should not leave the process in an unusable state.
 
 To achieve this, build the new address space in a temporary page table. Only after all segments are loaded successfully, switch the process to the new page table and free the old one. If anything fails, free the temporary page table and return an error.
+
+</div>
+</details>
 
 ---
 
@@ -159,7 +187,14 @@ Create `kernel/exec.c`:
 
 1. Create a `user/` directory with a simple user program (e.g., `hello.c` that writes "hello world" using the `write` system call wrapper).
 
-2. Compile user programs with the same cross-compiler, but targeting user-space: `-ffreestanding -nostdlib`, linked at a user-space base address (e.g., `0x0`), with a minimal entry point that calls `main` and then calls `exit`.
+2. <details>
+<summary>Why do user programs need -ffreestanding -nostdlib?</summary>
+<div>
+
+Compile user programs with the same cross-compiler, but targeting user-space: `-ffreestanding -nostdlib`, linked at a user-space base address (e.g., `0x0`), with a minimal entry point that calls `main` and then calls `exit`. The `-ffreestanding` flag tells the compiler that the standard library isn't available, and `-nostdlib` prevents linking against libc. This is necessary because user programs run without the standard C library — they can only call system calls through the kernel.
+
+</div>
+</details>
 
 3. Embed the compiled user program in the kernel (using `.incbin` or `objcopy`).
 

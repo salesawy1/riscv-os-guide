@@ -25,14 +25,28 @@ A **trap** is any event that causes the CPU to stop executing the current instru
 - A page fault (the virtual-to-physical translation failed)
 - An environment call (the `ecall` instruction, deliberately requesting a trap)
 
-Exceptions are synchronous because they happen at a deterministic point in the instruction stream — the specific instruction that caused the exception. If you run the same code with the same state, you get the same exception at the same instruction.
+<details>
+<summary>Why are exceptions called "synchronous"?</summary>
+<div>
+
+Because they happen deterministically at the exact instruction that caused them. Run the same code with the same state, and you hit the same exception at the same place. The instruction causes the trap. Compare this to interrupts, which can occur between any two instructions.
+
+</div>
+</details>
 
 **Interrupts** are asynchronous events caused by something external to the currently executing instruction. The CPU was happily executing your code when something outside demanded attention:
 - A timer interrupt (the [CLINT](https://sifive.cdn.prismic.io/sifive/0d163928-2128-42be-a75a-464df65e04e0_sifive-interrupt-cookbook.pdf)'s `mtime` reached `mtimecmp`)
 - An external interrupt (a device, like the UART, signaled via the PLIC)
 - A software interrupt (another hart wrote to your software interrupt register)
 
-Interrupts are asynchronous because they can occur between any two instructions. The CPU finishes the current instruction, notices the pending interrupt, and traps before starting the next instruction.
+<details>
+<summary>Why are interrupts called "asynchronous"?</summary>
+<div>
+
+Because they can happen between any two instructions, at unpredictable times. The CPU finishes the current instruction, notices a pending interrupt (UART data ready, timer fired, etc.), and traps before the next instruction. You can't predict where in your code the interrupt occurs.
+
+</div>
+</details>
 
 **Environment calls** ([`ecall`](https://github.com/riscv/riscv-isa-manual)) are technically exceptions, but they deserve special mention because they're *intentional* traps. A user program executes `ecall` to request a service from the kernel. The kernel examines the request, performs the service, and returns. This is the [system call](https://en.wikipedia.org/wiki/System_call) mechanism — the narrow, controlled bridge between unprivileged and privileged code.
 
@@ -48,7 +62,14 @@ When a trap occurs (regardless of type), the hardware performs these steps atomi
 
 4. **Save the privilege state.** The current privilege mode is saved in [`mstatus.MPP`](https://github.com/riscv/riscv-isa-manual/releases/download/Priv-v1.12/riscv-privileged-20211203.pdf) (or `sstatus.SPP`). The current interrupt enable state (`MIE` or `SIE`) is saved in `MPIE` (or `SPIE`).
 
-5. **Disable interrupts.** `mstatus.MIE` (or `sstatus.SIE`) is cleared. This prevents nested interrupts while the trap handler is getting set up. The handler can re-enable interrupts later if it wants to allow nesting.
+<details>
+<summary>Why does the hardware disable interrupts when entering a trap?</summary>
+<div>
+
+To prevent nested traps while setting up the handler. If interrupts stayed enabled and another trap fired, the hardware would overwrite `mepc` and `mcause` before the first handler saved them. Disabling interrupts blocks new traps until the handler has saved the context. The handler can re-enable them later if it wants to allow nesting.
+
+</div>
+</details>
 
 6. **Switch privilege mode.** The CPU enters M-mode (or S-mode, for delegated traps).
 
@@ -77,7 +98,14 @@ Bits 1:0    MODE    0 = Direct: all traps jump to BASE
 
 ### Direct Mode
 
-In direct mode, every trap — regardless of cause — jumps to the same address. Your handler reads `mcause` to determine what happened and dispatches accordingly. This is simpler to set up and is what we'll use initially.
+<details>
+<summary>Why is direct mode simpler than vectored mode?</summary>
+<div>
+
+Direct mode: all traps jump to one address, the handler reads `mcause` and dispatches. Vectored mode: the hardware computes the jump address based on `mcause`, jumping directly to different handlers. Vectored is faster (hardware dispatch vs. software) but requires more setup. Direct is simpler and adequate for a teaching OS.
+
+</div>
+</details>
 
 The handler at `BASE` is your universal trap entry point. It looks something like:
 
@@ -119,9 +147,14 @@ So the very first thing the trap handler must do is **save all general-purpose r
 
 ### The Problem: You Need a Register to Save Registers
 
-Here's the bootstrap problem. To save registers to memory, you need a base register pointing to the save area. But all registers currently belong to the trapped code. If you overwrite any register to hold the save area pointer, you've lost that register's value.
+<details>
+<summary>How do you save registers to memory if all registers belong to the trapped code?</summary>
+<div>
 
-This is where [`mscratch`](https://github.com/riscv/riscv-isa-manual/releases/download/Priv-v1.12/riscv-privileged-20211203.pdf) (or `sscratch`) comes in. The solution:
+The bootstrap problem: if you use a register to point to the save area, you lose its value. Solution: use `mscratch`, a CSR that the trap handler pre-loads with the trap frame address. At trap entry, swap `t0` with `mscratch` — now `t0` points to the save area and `mscratch` holds the old `t0` value (which needs saving). Use `t0` to save all other registers, then recover and save the old `t0`.
+
+</div>
+</details>
 
 1. **Before any trap occurs**, store the address of the trap frame (or a pointer to it) in `mscratch`.
 
@@ -154,10 +187,14 @@ Offset 256:  mstatus (saved status)
 
 That's 31 registers × 8 bytes = 248 bytes for the GPRs, plus the CSRs you want to save. Total trap frame size is typically 256 or 272 bytes (depending on how many CSRs you save).
 
-You save [`mepc`](https://github.com/riscv/riscv-isa-manual/releases/download/Priv-v1.12/riscv-privileged-20211203.pdf) and [`mstatus`](https://github.com/riscv/riscv-isa-manual/releases/download/Priv-v1.12/riscv-privileged-20211203.pdf) in the trap frame because:
-- A nested trap (if you re-enable interrupts) would overwrite `mepc` and `mstatus`
-- The C handler might need to read or modify `mepc` (e.g., advancing past `ecall`)
-- They need to be restored before [`mret`](https://github.com/riscv/riscv-isa-manual)
+<details>
+<summary>Why save `mepc` and `mstatus` in the trap frame?</summary>
+<div>
+
+If a nested trap fires (after re-enabling interrupts), it would overwrite these CSRs before the first handler had a chance to use them. The C handler might need to read `mepc` (to know where the trap occurred) or modify it (to skip an `ecall` instruction). They must be restored before `mret`. Saving them in the frame preserves them across nesting and allows the handler to examine/modify them.
+
+</div>
+</details>
 
 ### The Assembly: Trap Entry
 
@@ -348,41 +385,36 @@ If your trap handler catches these exceptions, prints the correct cause code and
 
 A subtle but important distinction:
 
-**For exceptions**, `mepc` points to the instruction that *caused* the exception. If you want to retry the instruction (e.g., after handling a page fault by mapping the needed page), you return with `mepc` unchanged — `mret` will re-execute the faulting instruction. If you want to skip the instruction (e.g., after handling an `ecall`), you advance `mepc` by the instruction length (4 bytes for a standard instruction, 2 for a compressed instruction) before returning.
+<details>
+<summary>Why does `mepc` point to different things for exceptions vs. interrupts?</summary>
+<div>
 
-**For interrupts**, `mepc` points to the instruction that *would have been executed next* if the interrupt hadn't occurred. When you return from an interrupt, you return with `mepc` unchanged — the interrupted instruction hasn't executed yet and needs to be executed now.
+For exceptions: `mepc` points to the *faulting* instruction. If you want to retry it (after fixing the problem), return unchanged. If you want to skip it (after `ecall`), advance `mepc`. For interrupts: `mepc` points to the *next* instruction (the one that would have run). Return unchanged — the next instruction still needs to execute. The difference reflects what the hardware is trying to communicate: "this instruction failed" vs. "I interrupted between these two instructions."
 
-This distinction matters when your handler modifies `mepc`. For `ecall` handling:
+</div>
+</details>
 
-```
-mepc += 4;  // advance past the ecall instruction
-```
+<details>
+<summary>When should you modify `mepc` in a trap handler?</summary>
+<div>
 
-For timer interrupt handling:
+For `ecall`: advance `mepc` by 4 (instruction length) to skip past the `ecall`. For interrupts: don't modify — the next instruction still needs to run. For page faults: don't modify — you want to retry the faulting instruction (after mapping the page). The pattern: modify `mepc` only if you want to change what executes next, otherwise leave it for the natural flow.
 
-```
-// don't modify mepc — return to the interrupted instruction
-```
-
-For page fault handling:
-
-```
-// map the faulting page, then:
-// don't modify mepc — retry the faulting instruction
-// (if you can't map the page, kill the process instead)
-```
+</div>
+</details>
 
 ---
 
 ## Trap Delegation (Setting the Stage)
 
-Right now, all traps go to M-mode (because we haven't delegated anything, and M-mode is the only level that handles traps by default). Eventually, you'll want most traps handled in S-mode, because:
+<details>
+<summary>Why do you eventually want to handle traps in S-mode instead of M-mode?</summary>
+<div>
 
-1. Your kernel will run in S-mode (after transitioning from M-mode)
-2. S-mode has access to virtual memory (`satp`), which M-mode doesn't
-3. The M-mode handler should be minimal (firmware-level), while the S-mode handler does the real OS work
+Your kernel will run in S-mode (you transition from M-mode). S-mode has access to virtual memory via `satp`; M-mode doesn't. The M-mode handler should be minimal (firmware-level), while S-mode does the real OS work (paging, process management, etc.). Delegation via `medeleg` and `mideleg` routes trap types to S-mode. For now, you're in M-mode, so all traps go there.
 
-Delegation is configured via `medeleg` (exception delegation) and `mideleg` (interrupt delegation). Setting a bit in these registers causes the corresponding trap type to go directly to S-mode instead of M-mode.
+</div>
+</details>
 
 We won't set up delegation yet — we're still in M-mode. But structure your code so that the transition is easy: use a consistent trap frame format, keep the handler dispatch logic generic, and be prepared to duplicate the assembly trap entry/exit for S-mode (with `sscratch`, `sepc`, `scause`, `stvec`, and `sret` instead of their M-mode counterparts).
 

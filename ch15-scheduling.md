@@ -35,9 +35,14 @@ Your scheduler from Chapter 14 is already a [round-robin](https://en.wikipedia.o
 
 ### Trade-offs
 
-**Short quantum** → Better responsiveness (interactive programs feel snappier), but more [context switch](https://en.wikipedia.org/wiki/Context_switch) overhead (switches consume CPU time and flush the [TLB](https://en.wikipedia.org/wiki/Translation_lookaside_buffer)).
+<details>
+<summary>Why is the time quantum such a critical parameter?</summary>
+<div>
 
-**Long quantum** → Less overhead, better throughput for CPU-bound tasks, but worse responsiveness for interactive tasks.
+Short quantum: Better responsiveness (interactive programs feel snappier), but more context switch overhead (switches consume CPU time and flush the TLB). Long quantum: Less overhead and better throughput for CPU-bound tasks, but worse responsiveness for interactive tasks. Concrete example: With a 1 ms quantum on a 1000-process system, the scheduler would switch every millisecond and spend most time switching instead of running useful work. With a 1-second quantum, a user typing at the keyboard would wait up to 1 second to see their keystroke echoed. The "right" quantum balances throughput and responsiveness.
+
+</div>
+</details>
 
 Linux's [CFS](https://docs.kernel.org/scheduler/sched-design-CFS.html) (Completely Fair Scheduler) uses a dynamic quantum that varies based on the number of runnable processes and their priorities. For our OS, a fixed quantum of 1–3 ticks works fine.
 
@@ -65,7 +70,14 @@ Add a `priority` field to your `struct process`. The scheduler, instead of scann
 
 ### Starvation
 
-The problem with strict priority scheduling: **[starvation](https://en.wikipedia.org/wiki/Starvation_(computer_science)).** If high-priority processes are always READY, low-priority processes never run. They're perpetually passed over.
+<details>
+<summary>What's the problem with strict priority scheduling, and why does starvation happen?</summary>
+<div>
+
+If high-priority processes are always READY, low-priority processes never get scheduled. They're perpetually skipped over — starved of CPU time. For example, if a high-priority real-time task keeps submitting new work, the scheduler will always find it first and never get to lower-priority background tasks. The system becomes unresponsive to non-urgent work.
+
+</div>
+</details>
 
 Solutions:
 - **Aging:** Increase a process's priority over time if it hasn't been scheduled. Eventually, a starved process's priority rises above the high-priority processes, and it gets a turn.
@@ -115,6 +127,15 @@ void wakeup(void *channel) {
             p->state = READY;
 }
 ```
+
+<details>
+<summary>Why use 'channels' to match sleepers with wake events? Why not just wake a specific process by PID?</summary>
+<div>
+
+Channels decouple the sleeper from the waker. Multiple processes can sleep on the same channel (multiple readers waiting for data from the same pipe), and a single wakeup call wakes them all. If you woke by PID, you'd need to know which process to wake — and you might not know it (the UART driver doesn't know which reader called read()). Channels also support many-to-many patterns: multiple readers on one channel, multiple events that signal the same channel. The abstraction is more flexible and cleaner.
+
+</div>
+</details>
 
 The `sleep`/`wakeup` mechanism: a process sleeps on a "channel" (an arbitrary identifier, typically the address of the resource it's waiting for). When the resource is available (e.g., the UART receives a character), the interrupt handler calls `wakeup` with that channel, moving all sleeping processes back to READY.
 

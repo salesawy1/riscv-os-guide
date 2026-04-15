@@ -22,17 +22,25 @@ In application programming, a pointer is "a variable that holds the address of a
 
 This means that in OS development, you will regularly do things that application C considers insane:
 
-**Casting integers to pointers.** The [UART](https://en.wikipedia.org/wiki/Universal_asynchronous_receiver%E2%80%93transmitter) device on the QEMU `virt` machine lives at physical address `0x10000000`. To write a byte to the UART's transmit register, you need a pointer to that address. There's no variable there. There's no `malloc` that returned that address. You just *know* — from the hardware specification — that address `0x10000000` is the UART. So you cast:
+<details>
+<summary>How do you access hardware registers that don't have variables?</summary>
+<div>
 
-The concept here is to take a known hardware address, cast it to a pointer of the appropriate type, and dereference it. When you write through that pointer, the CPU puts the address on the memory bus, the memory controller sees that it falls in the MMIO range, and routes the write to the UART hardware instead of to RAM.
+The [UART](https://en.wikipedia.org/wiki/Universal_asynchronous_receiver%E2%80%93transmitter) device on the QEMU `virt` machine lives at physical address `0x10000000`. There's no variable there — it's just a hardware location. You cast the address to a pointer of the appropriate type, then dereference it. When you write through that pointer, the CPU puts the address on the memory bus, and the memory controller routes the write to the hardware instead of to RAM. This is completely normal in OS development.
 
-This is completely normal in OS and embedded development. The C standard calls this "implementation-defined behavior" — it works on every real platform, but the standard won't guarantee it because the standard doesn't know your memory map. You'll do it constantly.
+</div>
+</details>
 
 **Pointer arithmetic for navigating structures.** When you're managing page tables (Chapter 10), you'll compute addresses by combining a base address with offsets calculated from bitfields of a virtual address. You'll take a physical frame number, shift it left by 12 bits to get a physical address, cast it to a pointer, and index into a table. Every step is pointer arithmetic rooted in a deep understanding of the hardware's data structures.
 
-**Pointers to specific memory regions.** Your linker script exports symbols like `_bss_start` and `_bss_end`. These aren't variables — they don't have storage. They're just addresses. To use them in C, you declare them as `extern char _bss_start[];` or `extern char _bss_end[];`. The "array of unknown size" trick is a C idiom for "this is an address, don't try to dereference it as a single value — just use it as a pointer." You then iterate from `_bss_start` to `_bss_end` and zero out every byte.
+<details>
+<summary>Why declare _bss_start[] instead of _bss_start*?</summary>
+<div>
 
-Wait — why `extern char _bss_start[]` and not `extern char *_bss_start`? This is subtle and important. If you declare it as a `char *`, the compiler thinks there's a *pointer variable* at the linker symbol's address — it will try to load the pointer's value from that memory location. But the linker symbol isn't a variable; it's just an address. There's no pointer stored in memory at `_bss_start`. The array declaration tells the compiler: "this symbol IS the address," not "this symbol is a variable that CONTAINS an address." The resulting machine code is different, and the pointer version will crash or give garbage.
+If you declare `extern char *_bss_start`, the compiler treats it as a pointer *variable* and tries to load its value from memory at the symbol's address. But `_bss_start` is just an address, not a variable. Declaring `extern char _bss_start[]` tells the compiler "this IS the address itself" instead of "this is a variable containing an address." The array declaration produces correct machine code; the pointer declaration will crash.
+
+</div>
+</details>
 
 > **Aside: Why C allows all this**
 >
@@ -44,19 +52,16 @@ Wait — why `extern char _bss_start[]` and not `extern char *_bss_start`? This 
 
 ## Volatile: When the Compiler Is Too Smart
 
-The C compiler is an aggressive optimizer. When it sees code like this conceptually — read a variable, check if it's zero, read it again, check if it's zero again — it says, "I already read this variable and it was zero. Nothing in this function changed it. The second read will return zero too. I'll just use the cached value."
+<details>
+<summary>Why does the compiler eliminate reads from the same address?</summary>
+<div>
 
-For normal variables, this optimization is correct and desirable. For hardware registers, it's catastrophic.
+The C compiler optimizes: if you read a variable twice and nothing in your code modifies it, the compiler caches the first read and uses it for the second read. For normal variables, this is correct. For a UART status register, it's catastrophic — the hardware updates the register between reads, but the compiler doesn't know that and assumes the value never changes. The result: your wait-for-ready loop becomes either an infinite loop or no loop at all.
 
-Consider a UART status register. You want to wait until the UART is ready to transmit. Conceptually, you read the status register in a loop, checking a "ready" bit. The register is at a fixed memory address. From the compiler's perspective, you're reading the same memory location repeatedly in a loop, and nothing in your C code writes to that location. The optimizer concludes that the value will never change and replaces your loop with either an infinite loop (if the first read said "not ready") or a straight-through path (if the first read said "ready"). Either way, it's wrong — the hardware updates that register independently of your code.
+</div>
+</details>
 
-**[`volatile`](https://en.cppreference.com/w/c/language/volatile) tells the compiler: "Every read and write to this variable must actually happen. Do not cache it. Do not reorder it. Do not optimize it away."**
-
-More precisely, the C standard says that accesses to `volatile`-qualified objects are *side effects*, and the compiler must preserve all side effects in the order specified by the abstract machine (with some caveats about sequence points). This means:
-
-1. Every read from a `volatile` variable generates an actual load instruction. The compiler cannot use a previously cached value.
-2. Every write to a `volatile` variable generates an actual store instruction. The compiler cannot defer it, combine it with other writes, or eliminate it as "dead."
-3. Volatile accesses are not reordered with respect to other volatile accesses. (Non-volatile accesses *can* still be reordered around volatile ones, though — `volatile` is weaker than a full memory barrier. More on this in the architecture chapter.)
+**[`volatile`](https://en.cppreference.com/w/c/language/volatile)** tells the compiler: "Every read and write to this variable must actually happen. Do not cache it. Do not reorder it. Do not optimize it away." This means each access generates an actual load or store instruction, preventing the compiler from caching values or eliminating "redundant" accesses.
 
 ### Where You'll Use Volatile
 
@@ -118,15 +123,25 @@ You'll do this *constantly*. Get to the point where building and tearing apart b
 
 In application C, you think of a struct as a bundle of related data. In OS C, you think of a struct as a *memory layout specification*. When you define a struct that maps to a hardware register block or an on-disk data structure, every field must be at a precise byte offset. The compiler's layout choices — padding, alignment, ordering — become your problem.
 
-### Alignment and Padding
+<details>
+<summary>Why does the compiler add padding between struct fields?</summary>
+<div>
 
-The compiler inserts padding between struct fields to satisfy alignment requirements. Consider conceptually a struct with a `char` field followed by a `uint32_t` field. On most architectures, `uint32_t` must be aligned to a 4-byte boundary. So the compiler inserts 3 bytes of padding after the `char` to push the `uint32_t` to offset 4. The struct's total size is 8 bytes, not 5.
+CPUs access multi-byte values (like `uint32_t`) faster when they're aligned to boundaries (4-byte, 8-byte boundaries, etc.). The compiler adds padding to satisfy alignment requirements. A `char` followed by `uint32_t` becomes a `char` + 3 bytes of padding + `uint32_t`. The struct's total size is 8 bytes, not 5. For kernel data structures mapping hardware or on-disk formats, you must match the exact specification, so you need to understand alignment to avoid silent data corruption.
 
-For most kernel data structures, this padding is fine — the compiler knows what it's doing, and accessing misaligned data on RISC-V would cause a trap. But when you're matching an external specification — a device register block, an ELF header, a filesystem superblock — the layout must exactly match the spec. If the spec says a field is at offset 5, and the compiler puts it at offset 8 due to padding, your driver reads the wrong data.
+</div>
+</details>
 
 ### Controlling Layout
 
-**`__attribute__((packed))`** tells GCC to eliminate all padding — fields are placed at the next available byte with no alignment consideration. This produces structs that exactly match their declared size, byte for byte. The trade-off is that accessing fields may generate slower code (because the compiler must handle potential misalignment) and on some architectures, misaligned access causes a trap. On RISC-V, misaligned access *may* be supported in hardware, *may* trap and be handled by firmware, or *may* just fault — it's implementation-defined. For hardware register structs, you typically don't need `packed` because hardware designers align their registers properly. For on-disk formats and network protocols, `packed` is sometimes necessary.
+<details>
+<summary>When should you use __attribute__((packed))?</summary>
+<div>
+
+`packed` removes all padding, placing fields at consecutive bytes. This is necessary when matching on-disk data structures or network protocols that don't have padding. Hardware register blocks typically don't need it because hardware designers already align registers properly. Using `packed` when unnecessary can cause slower code (misaligned access) and potential traps on RISC-V. Use it only when the specification explicitly requires it.
+
+</div>
+</details>
 
 **`__attribute__((aligned(n)))`** forces a struct (or field) to be aligned to an `n`-byte boundary. You'll use this for structures that must be page-aligned, like page tables.
 
@@ -307,18 +322,23 @@ Once processes exist (Chapter 13), each process will have its own kernel stack. 
 
 ## Memory You Must Provide
 
-Remember `-ffreestanding`? The compiler *promises* not to assume the standard library exists, but it *reserves the right* to generate calls to a few fundamental functions. These are:
+<details>
+<summary>Why does the compiler generate calls to memcpy if you never wrote one?</summary>
+<div>
 
-- **`memcpy(dest, src, n)`** — Copy `n` bytes from `src` to `dest`. The compiler generates this for struct assignment, large constant initializers, and sometimes for passing structs by value.
-- **`memset(dest, c, n)`** — Set `n` bytes at `dest` to the value `c`. Generated for zero-initialization of local variables, arrays, and structs.
-- **`memmove(dest, src, n)`** — Like `memcpy`, but handles overlapping source and destination. The compiler may generate this for some struct operations.
-- **`memcmp(a, b, n)`** — Compare `n` bytes. Less commonly generated by the compiler, but you'll want it anyway.
+With `-ffreestanding`, the compiler still reserves the right to optimize struct assignments, array initialization, and struct passing using `memcpy`, `memset`, or `memmove`. If you don't provide these, you'll get linker errors — not from code you consciously wrote, but from optimizations the compiler generated. You must implement them, or forbid the compiler optimizations that trigger them.
 
-You must implement these yourself. If you don't, you'll get linker errors like "undefined reference to `memcpy`" — not from code you wrote, but from code the *compiler generated* behind your back.
+</div>
+</details>
 
-The implementations are straightforward: `memset` is a loop that writes a byte value. `memcpy` is a loop that copies bytes. `memmove` is `memcpy` but handles the case where source and destination overlap (copy backward if destination is above source). These are your first C functions, and they'll be among the most-called functions in your entire kernel.
+<details>
+<summary>Should memcpy copy bytes or words for speed?</summary>
+<div>
 
-A subtlety: for performance, real implementations of `memcpy` copy word-sized (8-byte on RV64) chunks when alignment allows, falling back to byte-by-byte for unaligned tails. For your initial implementation, byte-by-byte is fine. Optimize later if you care — but frankly, for a teaching OS, you won't notice the difference.
+Real implementations copy word-sized (8-byte on RV64) chunks when aligned, falling back to byte-by-byte for unaligned data. This is significantly faster: copying 1024 bytes with 8-byte words takes 128 operations instead of 1024. For a teaching OS, byte-by-byte is fine to start — you won't notice the difference. Optimize when you measure it matters.
+
+</div>
+</details>
 
 ---
 
@@ -332,13 +352,14 @@ One important note: never use `strcpy` — use `strncpy` or, better yet, your ow
 
 ## A Word on `static` and Linkage
 
-In C, `static` has two meanings depending on context:
+<details>
+<summary>Why use static for functions you don't export?</summary>
+<div>
 
-**At file scope** (outside any function): `static` gives the variable or function *internal linkage* — it's only visible within that translation unit (`.c` file). This is the primary encapsulation mechanism in C. Use it for every function and variable that doesn't need to be accessed from other files. This prevents name collisions (you can have a `static` helper function named `init()` in every file without conflict) and enables the compiler to inline or eliminate functions it can prove are only called locally.
+`static` at file scope prevents name collisions. Two files can both define a `static` function named `init()` without conflict — each is local to its file. Without `static`, a global `init()` in two files causes a linker error or silent shadowing, leading to hard-to-debug problems. In a monolithic kernel, make everything `static` by default; only remove it when you need cross-file access. This is "private by default."
 
-**At block scope** (inside a function): `static` gives the variable *static storage duration* — it persists across function calls, initialized once. Less common in kernel code, but you might use it for "initialized on first call" patterns.
-
-In OS development, where your entire codebase links into a single binary, name collisions are a real hazard. Two files that both define a global function `init()` will cause a linker error (or worse, one silently shadows the other). Make everything `static` by default; only remove `static` when you need cross-file access. This is the C equivalent of "private by default."
+</div>
+</details>
 
 ---
 

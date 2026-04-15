@@ -53,7 +53,16 @@ UNUSED  →  READY  ⇄  RUNNING
 - **READY:** The process is runnable but not currently on the CPU. It's in the scheduler's [run queue](https://en.wikipedia.org/wiki/Run_queue), waiting for its turn.
 - **RUNNING:** The process is currently executing on the CPU. On a single-core system, exactly one process is RUNNING at any time.
 - **BLOCKED** (or **SLEEPING**): The process is waiting for something — I/O completion, a timer, a signal from another process. It can't run until the event occurs.
-- **[ZOMBIE](https://en.wikipedia.org/wiki/Zombie_process):** The process has finished executing (called `exit()`) but its parent hasn't yet collected its exit status (via `wait()`). The PCB is kept around so the parent can retrieve the exit code.
+- **[ZOMBIE](https://en.wikipedia.org/wiki/Zombie_process):** The process has finished executing (called `exit()`) but its parent hasn't yet collected its exit status (via `wait()`).
+
+<details>
+<summary>Why does the ZOMBIE state exist? Why not just free the PCB when exit() is called?</summary>
+<div>
+
+Because the parent process needs to collect the child's exit status via `wait()`. If the kernel freed the PCB immediately, the parent would have nowhere to retrieve the exit code. The PCB is kept around so the parent can retrieve it. Once the parent calls `wait()`, the exit status is delivered and the PCB slot can finally be freed.
+
+</div>
+</details>
 
 The state transitions are:
 - UNUSED → READY: Process is created (`fork()`)
@@ -71,9 +80,14 @@ The trap frame (from Chapter 7) stores the process's user-mode register state. W
 
 This is distinct from the trap frame and easy to confuse. The **context** stores the process's *kernel-mode* register state — specifically, the [callee-saved registers](https://github.com/riscv-non-isa/riscv-elf-psabi-doc) that are needed to resume kernel-mode execution of this process. We'll discuss this in detail in Chapter 14.
 
-The distinction:
-- **Trap frame:** Saves user registers when entering the kernel (trap entry). Restored on trap return.
-- **Context:** Saves kernel registers when switching to another process. Restored when switching back.
+<details>
+<summary>What's the difference between the trap frame and the context?</summary>
+<div>
+
+The trap frame captures user-mode state when a process enters the kernel (via trap entry). It's restored when returning to user mode (trap exit). The context captures kernel-mode state when switching to a different process in the middle of kernel code execution. It's restored when the scheduler switches back to that process. They operate at different privilege levels and are restored at different times.
+
+</div>
+</details>
 
 ### Page Table
 
@@ -81,7 +95,16 @@ Each process has its own page table, giving it a private virtual address space. 
 
 ### Kernel Stack
 
-Each process has its own kernel stack — a separate stack used when the process is executing kernel code (handling a [trap](https://en.wikipedia.org/wiki/Trap_(computing)), executing a system call). Why not use the process's user stack? Because the user stack is in user memory, which the user controls. A malicious or buggy process could set its stack pointer to garbage, and if the kernel used that stack, the kernel would crash. The kernel stack is in kernel memory, inaccessible to the user process, and always valid.
+Each process has its own kernel stack — a separate stack used when the process is executing kernel code (handling a [trap](https://en.wikipedia.org/wiki/Trap_(computing)), executing a system call).
+
+<details>
+<summary>Why can't the kernel just use the process's user stack?</summary>
+<div>
+
+Because the user stack is in user memory, which the user controls. A malicious or buggy process could set its stack pointer to garbage, and if the kernel used that stack, the kernel would crash. The kernel stack is in kernel memory, inaccessible to the user process, and always valid.
+
+</div>
+</details>
 
 Kernel stacks are typically one or two pages (4–8 KiB). Linux uses 8 KiB (2 pages) by default. xv6 uses one page.
 
@@ -141,7 +164,14 @@ When process A takes a trap:
 4. Trap handler runs on A's kernel stack
 5. On return, trap exit restores registers from the trap frame and returns to U-mode
 
-Each process has its own kernel stack, so process A's trap handling never interferes with process B's.
+<details>
+<summary>Why must each process have its own kernel stack? What goes wrong if they share?</summary>
+<div>
+
+Consider this scenario: Process A is in the middle of a system call, partway through executing a kernel function with local variables on the stack. A timer interrupt fires, the trap entry switches to A's kernel stack and saves registers. The trap handler decides to switch to process B. Later, process B makes a system call, traps to the kernel, and starts pushing its own variables onto the stack. If both processes shared the same kernel stack, B would overwrite A's local variables and return addresses. When A resumes, its stack is corrupted. Each process needs its own kernel stack so trap entry and system call handlers don't interfere.
+
+</div>
+</details>
 
 ---
 
@@ -170,7 +200,14 @@ Each process has its own virtual address space:
 
 The user portion (text, data, heap, stack) is unique to each process. The kernel portion is identical across all processes — the same PTEs pointing to the same physical frames.
 
-When the OS switches from process A to process B, it changes `satp` to point to B's page table. The kernel portion doesn't change (same physical mappings), but the user portion is now B's memory. This is how isolation works: B's pointers can't reach A's physical memory because A's mappings aren't in B's page table.
+<details>
+<summary>How does changing the page table actually isolate processes?</summary>
+<div>
+
+When the OS switches from process A to process B, it changes `satp` to point to B's page table. The kernel portion doesn't change (same physical mappings), but the user portion is now B's memory. This is isolation: B's virtual pointers translate to different physical frames than A's same virtual pointers. B can't reach A's physical memory because A's mappings aren't in B's page table.
+
+</div>
+</details>
 
 ---
 

@@ -18,9 +18,23 @@ This chapter implements the U-mode transition: configuring the hardware so that 
 
 When the CPU is in U-mode:
 
-1. **CSR access is forbidden.** Any `csrr`, `csrw`, or other CSR instruction causes an illegal instruction exception. User programs can't read the timer, can't modify the trap vector, can't change the page table.
+1. <details>
+<summary>Why can't a user program just execute a CSR instruction like csrr or csrw?</summary>
+<div>
 
-2. **Privileged instructions are forbidden.** `sret`, `mret`, `wfi`, `sfence.vma` — all cause illegal instruction exceptions.
+Any `csrr`, `csrw`, or other CSR instruction causes an illegal instruction exception. User programs can't read the timer, can't modify the trap vector, can't change the page table. The hardware checks the privilege level on every CSR access.
+
+</div>
+</details>
+
+2. <details>
+<summary>What prevents a user program from executing privileged instructions like sret or wfi?</summary>
+<div>
+
+Privileged instructions like `sret`, `mret`, `wfi`, `sfence.vma` all cause illegal instruction exceptions in U-mode. Only S-mode can execute these.
+
+</div>
+</details>
 
 3. **Memory access is restricted by the page table.** The [MMU](https://en.wikipedia.org/wiki/Memory_management_unit) checks the U bit on every PTE. Pages with U=0 (kernel pages) are inaccessible. Any access causes a page fault.
 
@@ -58,15 +72,18 @@ A user program that tries to access a kernel address gets a page fault. The kern
 
 ### The SUM Bit
 
-There's a subtle problem: sometimes the kernel needs to access user memory. For example, the `write()` system call needs to read a buffer from user space. But if the kernel is in S-mode and the page has U=1, can S-mode access it?
+<details>
+<summary>Why can't the kernel in S-mode just access user pages (U=1) directly?</summary>
+<div>
 
-By default, **no** — S-mode cannot access pages with U=1. This is a security feature: it prevents the kernel from accidentally (or maliciously, in a compromised kernel) accessing user memory when it shouldn't.
-
-The `[SUM](https://github.com/riscv/riscv-isa-manual/releases/download/Priv-v1.12/riscv-privileged-20211203.pdf)` (Supervisor User Memory access) bit in `sstatus` controls this:
+By default, S-mode cannot access pages with U=1. This is a security feature: it prevents the kernel from accidentally (or maliciously, in a compromised kernel) accessing user memory when it shouldn't. The `[SUM](https://github.com/riscv/riscv-isa-manual/releases/download/Priv-v1.12/riscv-privileged-20211203.pdf)` (Supervisor User Memory access) bit in `sstatus` controls this:
 - SUM=0: S-mode cannot access U=1 pages (default, secure)
 - SUM=1: S-mode can access U=1 pages
 
 Your kernel should set SUM=1 only when it intentionally accesses user memory (e.g., copying arguments from a system call), and clear it afterward. Or you can leave SUM=1 permanently if you're willing to forgo this protection layer. [xv6](https://github.com/mit-pdos/xv6-riscv) leaves SUM=0 and uses special `copyin`/`copyout` functions that temporarily enable access.
+
+</div>
+</details>
 
 ---
 
@@ -84,7 +101,11 @@ Your trap handler runs in S-mode. It saves the user registers to the trap frame,
 
 ### The Stack Switch
 
-In S-mode, the trap handler runs on the process's **kernel stack**, not the user stack. The user stack pointer is untrusted — the user program might have set it to garbage. The trap entry assembly must switch from the user stack to the kernel stack:
+<details>
+<summary>Why does the kernel need to switch stacks when trapping from U-mode?</summary>
+<div>
+
+The user stack pointer is untrusted — the user program might have set it to garbage or to a malicious address. If the kernel executed on the user-controlled stack, an attacker could set `sp` to point into kernel data or cause the kernel to overflow into sensitive memory regions. The trap entry assembly must switch from the user stack to the kernel stack:
 
 1. At trap entry: `sscratch` contains the kernel stack pointer (or a pointer to the trap frame at the top of the kernel stack). The `[csrrw](https://github.com/riscv/riscv-isa-manual/releases/download/Priv-v1.12/riscv-privileged-20211203.pdf)` swap trick gives the handler a working register.
 2. The handler saves `sp` (the user stack pointer) to the trap frame.
@@ -96,7 +117,8 @@ At trap exit:
 2. It restores `sscratch` to the kernel stack pointer (for the next trap).
 3. It executes `sret`.
 
-This stack switch is critical for security. Without it, the kernel would execute on the user-controlled stack, which could be at any arbitrary address.
+</div>
+</details>
 
 ---
 

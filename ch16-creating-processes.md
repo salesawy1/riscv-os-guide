@@ -36,7 +36,14 @@ When process P calls `fork()`:
 
 ### The Return Value Trick
 
-`fork()` returns *twice*: once in the parent (returning the child's PID) and once in the child (returning 0). This is possible because we set different `a0` values in the two processes' trap frames. When each process returns from the system call, the trap exit restores `a0` from its trap frame, and each sees its own return value.
+<details>
+<summary>How can fork() return twice — once in the parent and once in the child?</summary>
+<div>
+
+We set different `a0` values in the two processes' trap frames before they return from the system call. When each process returns, the trap exit restores `a0` from its own trap frame — so the parent gets the child's PID and the child gets 0. They both return from the same fork() call but see different values. The program uses this return value to decide which branch to take.
+
+</div>
+</details>
 
 The program uses the return value to decide which branch of execution to take:
 
@@ -51,19 +58,14 @@ if (pid == 0) {
 }
 ```
 
-> **Aside: Why fork? Why not just "create process"?**
->
-> `fork()` might seem roundabout. Why clone the entire process just to replace it with `exec()`? Why not have a single `spawn(program, args)` that creates a fresh process from scratch?
->
-> The fork/exec split is a deliberate Unix design choice. Between `fork` and `exec`, the child can modify its own state — redirect file descriptors, change the working directory, set up pipes, change signal handlers — before the new program starts. All of this happens using the same system calls the parent uses, with no special "process creation API." The child inherits everything from the parent and selectively modifies what's needed.
->
-> Windows uses `CreateProcess`, which is a single system call with dozens of parameters for configuring the new process. Unix's approach is simpler (each configuration is a separate system call) and more flexible (you can compose configurations arbitrarily).
->
-> The downside of fork: copying the entire address space is expensive. Linux mitigates this with **[copy-on-write](https://en.wikipedia.org/wiki/Copy-on-write) (COW)**: fork doesn't actually copy the pages. Instead, both parent and child share the same physical frames, marked read-only. When either process writes to a shared page, a [page fault](https://en.wikipedia.org/wiki/Page_fault) triggers, and the kernel copies just that page. If the child immediately calls `exec()` (the common case), most pages are never copied.
->
-> For your teaching OS, a full copy is simpler and sufficient. COW is an optimization for later.
->
-> [OSTEP Chapter 5 (Interlude: Process API)](https://pages.cs.wisc.edu/~remzi/OSTEP/cpu-api.pdf) has an excellent discussion of the fork/exec design.
+<details>
+<summary>Why fork + exec? Why not just a single "create process" system call?</summary>
+<div>
+
+`fork()` alone seems roundabout — clone the entire process just to replace it with `exec()`? The fork/exec split is a deliberate Unix design choice. Between fork and exec, the child can modify its own state — redirect file descriptors, change the working directory, set up pipes, change signal handlers — before the new program starts. All of this uses the same system calls the parent uses, with no special "process creation API." The child inherits everything and selectively modifies what's needed. Windows uses `CreateProcess`, which is a single call with dozens of parameters. Unix's approach is simpler (each step is a separate call) and more flexible (you compose them arbitrarily). For a teaching OS, full address space copying is fine. Real systems use copy-on-write to avoid copying pages until they're actually modified.
+
+</div>
+</details>
 
 ---
 
@@ -75,6 +77,15 @@ The most complex part of `fork()` is copying the parent's user page table. You n
 2. Allocate a new physical frame (`kalloc()`)
 3. Copy 4096 bytes from the old frame to the new frame (`memcpy`)
 4. Map the new frame in the child's page table at the same virtual address with the same permissions
+
+<details>
+<summary>After fork(), parent and child have the same virtual addresses but different physical frames. Why must the frames be different?</summary>
+<div>
+
+Because they need isolated address spaces. If they shared the same physical frames, writes by the child would be visible to the parent — they'd both see the same memory. The entire point of process isolation is that each process has its own virtual-to-physical mappings. Different frames for the same virtual address means a write to VA X in the child goes to the child's physical frame, not the parent's.
+
+</div>
+</details>
 
 This requires a page table walk function that visits every leaf PTE. You can implement this as a recursive walk: for each level-2 entry, if valid, walk its level-1 entries; for each level-1 entry, if valid, walk its level-0 entries; for each level-0 entry, if valid and a leaf, copy the page.
 
@@ -94,7 +105,14 @@ When a process calls `exit()`:
 4. Re-parent any children to the init process (PID 1) — orphaned children need a parent to collect their exit status
 5. Call the scheduler (this process is done; switch to something else)
 
-The process doesn't free its own resources — it can't, because it's currently running on its kernel stack and using its page table. The parent frees the child's resources in `wait()`.
+<details>
+<summary>Why can't a process free its own resources in exit()? Why must the parent do it?</summary>
+<div>
+
+A process can't free its own kernel stack while still running on it — it would be freeing the memory it's currently executing from. Similarly, it can't free its own page table while the MMU is still using it. The process must leave these resources intact for the kernel to clean up later. That's the parent's job in `wait()` — after the child has exited and is now a zombie, the parent can safely free the kernel stack and page table from a different execution context.
+
+</div>
+</details>
 
 ### wait()
 

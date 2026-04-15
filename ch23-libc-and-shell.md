@@ -33,6 +33,15 @@ void *sbrk(int n);
 int getpid(void);
 ```
 
+<details>
+<summary>Why does libc wrap the assembly syscall functions in C?</summary>
+<div>
+
+Portability and convention. User programs expect standard C signatures like `fork()` with no arguments, not assembly that requires setting up registers. Libc provides a standard interface that hides the architecture-specific details (which registers hold which arguments). On RISC-V, `a0` is the first argument; on ARM, it's `r0`. By wrapping in C, programs stay the same across architectures.
+
+</div>
+</details>
+
 These are thin wrappers — they put arguments in registers, load the system call number into `a7`, execute `ecall`, and return `a0`.
 
 ### String Functions
@@ -56,6 +65,15 @@ The most important function in any C library. Your user-space `printf` is simila
 2. Buffer the formatted characters
 3. Call `write(1, buffer, length)` to output them
 
+<details>
+<summary>Why should printf buffer output instead of calling write() for every character?</summary>
+<div>
+
+System calls are expensive — each one transitions to the kernel, flushes the CPU pipeline, manages privilege mode switches. Writing one character per syscall means 100 characters costs 100 syscalls. Buffering 256 characters and calling write once costs 1 syscall for 256 characters. The performance difference is huge. The tradeoff is that you need to flush the buffer on newlines or when full so output appears promptly.
+
+</div>
+</details>
+
 You can either:
 - Build the entire formatted string in a buffer, then call `write` once
 - Call `write` for each character (simpler but more system call overhead)
@@ -71,6 +89,15 @@ User-space dynamic memory allocation. This is the user-space equivalent of `kmal
 1. **`malloc(size)`**: If the free list has a suitable block, return it (same free list algorithm as Chapter 12). If not, call `sbrk(n)` to get more memory from the kernel, add it to the free list, and retry.
 
 2. **`free(ptr)`**: Return the block to the free list. Coalesce with adjacent free blocks if possible.
+
+<details>
+<summary>Why doesn't malloc just call sbrk() for every allocation?</summary>
+<div>
+
+Because sbrk() expands the heap in page-sized increments (4 KiB or more). If you call sbrk() for every malloc, you waste memory. Instead, malloc calls sbrk() once to get a large chunk, then subdivides it into smaller allocations using a free list. This amortizes the syscall cost and minimizes wasted space. When the free list is exhausted, malloc calls sbrk() again.
+
+</div>
+</details>
 
 The user-space allocator is layered: `sbrk` provides page-sized chunks from the kernel, and `malloc`/`free` subdivide them into arbitrary-sized allocations.
 
@@ -107,6 +134,15 @@ _start:
     li a7, SYS_exit
     ecall
 ```
+
+<details>
+<summary>Why is crt0 necessary? Why not just run main() directly?</summary>
+<div>
+
+The ELF loader jumps to the entry point (`_start`), not to `main`. The entry point is a convention — it's where user code begins execution. `_start` must set up the C environment (zero BSS if needed, call constructors if any) and then call `main`. More importantly, `_start` ensures that when `main()` returns, the program exits cleanly by calling the exit syscall. Without it, returning from main would execute whatever instruction follows in memory — likely garbage — and crash.
+
+</div>
+</details>
 
 This is linked as the entry point of every user program. When the program's `main()` returns, `_start` calls `exit()` with the return value. Without this, a returning `main` would execute whatever garbage follows it in memory.
 
@@ -170,6 +206,15 @@ Some commands can't be external programs — they need to modify the shell's own
 - **`cd directory`**: Changes the shell's current working directory. This can't be an external program because `exec` runs in a child process — changing the child's directory doesn't affect the parent.
 - **`exit`**: Exits the shell.
 
+<details>
+<summary>Why must `cd` be a shell built-in rather than an external program?</summary>
+<div>
+
+The current working directory is a per-process property. If `cd` were an external program, the shell would fork and the child would call `chdir()`. But `chdir()` only changes the child's working directory; the parent (the shell) remains in the old directory. When the child exits and the shell continues, you're still in the original directory. By implementing `cd` as a built-in, the shell changes its own directory directly, so the change persists. This is why every Unix shell has `cd` as a built-in, not a separate command.
+
+</div>
+</details>
+
 Handle these before the fork/exec path: if the command is a built-in, execute it directly in the shell process.
 
 ---
@@ -220,11 +265,9 @@ These are genuine Unix utilities, running on your OS. They use your C library, m
 
 2. **`printf` in user space calls `write(1, ...)`. `write` is a system call. Trace the full path** from `printf("hello")` in user code to characters appearing on the terminal ([variadic functions](https://en.wikipedia.org/wiki/Variadic_function) complicate printf). How many privilege transitions occur?
 
-3. **Why must `cd` be a shell built-in rather than an external program?** Explain what would happen if `cd` were implemented as a separate program run via fork/exec.
+3. **A simple shell reads input character-by-character using `read(0, &c, 1)`. This means one system call per character. How could you reduce this overhead?** (Hint: line buffering.)
 
-4. **User-space `malloc` calls `sbrk` to get memory from the kernel. Why not just call `sbrk` for every allocation?** What does `malloc` add on top of `sbrk`?
-
-5. **The shell reads one character at a time from stdin. This means one `read` system call per character. How could you reduce this overhead?** (Think about line buffering.)
+4. **In a shell with pipes (`ls | grep foo`), how would you implement the pipe?** (Think about the relationship between fork/exec and file descriptor redirection.)
 
 ---
 

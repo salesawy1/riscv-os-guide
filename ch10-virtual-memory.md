@@ -58,11 +58,16 @@ RISC-V supports multiple paging modes: Sv32 (32-bit virtual addresses, 2-level p
 
 Sv39 gives you a 39-bit virtual address space: 2^39 = 512 GiB. Half of this (the upper half, where bit 38 is set) is conventionally used for the kernel, and the other half for user programs. But we're getting ahead of ourselves.
 
-### Why Three Levels?
+<details>
+<summary>Why use three levels instead of one flat page table?</summary>
+<div>
 
-A 27-bit virtual page number could index a flat page table with 2^27 = 134 million entries. At 8 bytes per entry, that's 1 GiB of page table per process — absurdly wasteful, especially when most of the address space is empty.
+A flat table with 2^27 entries would require 1 GiB per process—absurdly wasteful when most of the address space is empty. A three-level radix tree allocates page table pages only for the parts of the address space that are actually used, saving memory dramatically.
 
-The three-level structure is a **[radix tree](https://en.wikipedia.org/wiki/Radix_tree)** that only allocates page table pages for the parts of the address space that are actually used. Each level covers 9 bits of the virtual page number:
+</div>
+</details>
+
+Each level covers 9 bits of the virtual page number:
 
 ```
 39-bit Virtual Address:
@@ -76,7 +81,14 @@ The three-level structure is a **[radix tree](https://en.wikipedia.org/wiki/Radi
 
 Each 9-bit index selects one of 512 entries in a page table page. A page table page is exactly 4 KiB (512 entries × 8 bytes per entry = 4096 bytes), which fits perfectly in one physical frame.
 
-### The Page Walk
+<details>
+<summary>Why does a page walk require three memory reads per translation?</summary>
+<div>
+
+The MMU walks three levels of the page table tree, reading one entry at each level to find the next table's address, until it reaches the leaf PTE with the physical frame number. Three memory reads per translation sounds expensive—which is why the TLB caches recent translations to avoid repeating the walk.
+
+</div>
+</details>
 
 When the CPU needs to translate a virtual address, the MMU performs a **[page walk](https://en.wikipedia.org/wiki/Page_table#Page_table_lookup)** — a series of memory reads through the three levels of the page table:
 
@@ -100,8 +112,6 @@ Step 4: If level1_entry is a valid, non-leaf entry:
 Step 5: level0_entry is the leaf PTE
         physical_address = (level0_entry.PPN << 12) | page_offset
 ```
-
-Three memory reads to translate one address. This sounds expensive, and it is — which is why the [TLB (Translation Lookaside Buffer)](https://en.wikipedia.org/wiki/Translation_lookaside_buffer) exists to cache recent translations. We'll discuss the TLB shortly.
 
 ### Superpages
 
@@ -153,7 +163,14 @@ Bit(s)  Field   Meaning
 63:54   Reserved (must be zero)
 ```
 
-### Permission Bits: R, W, X
+<details>
+<summary>Why are R, W, X used to distinguish non-leaf PTEs from leaf PTEs?</summary>
+<div>
+
+Non-leaf PTEs have R=W=X=0 (permission bits cleared), while leaf PTEs have at least one permission bit set. This elegantly reuses the same PTE structure for both "pointer to next table" and "actual page mapping"—the permission bits distinguish them. Any other design (like a separate flag bit) would be less elegant.
+
+</div>
+</details>
 
 The combination of R, W, X determines whether the PTE is a leaf (an actual mapping) or a non-leaf (a pointer to the next level):
 
@@ -167,10 +184,6 @@ The combination of R, W, X determines whether the PTE is a leaf (an actual mappi
 | 1 | 1 | 1 | Read-write-execute page (use sparingly) |
 | 0 | 1 | 0 | *Reserved* — illegal combination |
 | 0 | 1 | 1 | *Reserved* — illegal combination |
-
-A PTE with V=1 and R=W=X=0 is a non-leaf entry: its PPN points to the next level of the page table. A PTE with V=1 and any of R, W, X set is a leaf entry: its PPN is the physical frame number of the mapped page.
-
-This is elegant: the same structure serves as both "pointer to subtree" and "leaf mapping," distinguished solely by the permission bits.
 
 ### The U Bit
 
@@ -233,13 +246,16 @@ After writing `satp`, the **very next instruction fetch** goes through the page 
 
 ---
 
-## The TLB: Translation Lookaside Buffer
+<details>
+<summary>Why do we need a TLB if we have fast page table lookups?</summary>
+<div>
 
-Every memory access requires a virtual-to-physical translation. A page walk requires three memory reads (for Sv39). If every instruction fetch and every load/store required three extra memory reads, performance would be catastrophic — roughly 4x slowdown for every memory access.
+A page walk requires three memory reads per translation. If every memory access triggered a page walk, performance would drop 4x. The TLB is a hardware cache of recent translations that avoids repeated walks. With typical locality, most hot pages fit in the TLB (32-128 entries), so hit rates exceed 99%.
 
-The **[TLB (Translation Lookaside Buffer)](https://pages.cs.wisc.edu/~remzi/OSTEP/vm-tlbs.pdf)** is a hardware cache of recent page table translations. It stores recent VPN→PPN mappings, and the MMU checks the TLB before doing a page walk. TLB hits are fast (single cycle). TLB misses trigger the full page walk.
+</div>
+</details>
 
-In practice, TLBs have 32–128 entries and hit rates above 99%, because programs exhibit [locality](https://en.wikipedia.org/wiki/Locality_of_reference) — they access the same pages repeatedly. The few pages that a program's hot loop touches all fit in the TLB, so the page walk overhead is amortized across many accesses.
+Every memory access requires a virtual-to-physical translation. The **[TLB (Translation Lookaside Buffer)](https://pages.cs.wisc.edu/~remzi/OSTEP/vm-tlbs.pdf)** is a hardware cache of recent page table translations. It stores recent VPN→PPN mappings, and the MMU checks the TLB before doing a page walk. TLB hits are fast (single cycle). TLB misses trigger the full page walk.
 
 ### TLB Flushing: sfence.vma
 
@@ -250,13 +266,29 @@ When you modify a page table — change a PTE, add a mapping, remove a mapping �
 - `sfence.vma x0, rs2` — Flush all TLB entries with ASID in `rs2`
 - `sfence.vma rs1, rs2` — Flush the entry for a specific address and ASID
 
-For your initial implementation, use `sfence.vma` (flush everything) after any page table modification. It's less efficient than targeted flushes, but it's safe and simple.
+<details>
+<summary>What happens if you forget to flush the TLB after modifying a page table?</summary>
+<div>
 
-Forgetting to flush the TLB after modifying a page table is one of the most common and maddening bugs in OS development. The symptom: your page table modification seems to have no effect, because the CPU is still using the old, cached translation. Then, seemingly at random (when the TLB entry gets evicted), the new mapping takes effect. The bug is intermittent and appears timing-dependent. Always flush after modifying page tables.
+The CPU still uses the old, cached translation. Your page table modification has no effect until the TLB entry is evicted at random. The bug appears intermittent and timing-dependent—maddening to debug. Always flush after modifying page tables.
+
+</div>
+</details>
+
+For your initial implementation, use `sfence.vma` (flush everything) after any page table modification. It's less efficient than targeted flushes, but it's safe and simple.
 
 ---
 
 ## Building a Page Table
+
+<details>
+<summary>Why do intermediate page table pages need to be zeroed, but the leaf PTE doesn't?</summary>
+<div>
+
+A zeroed page table page has all PTEs with V=0 (invalid), so stale entries won't cause phantom mappings. A leaf PTE you're writing is your new mapping, so there's nothing to zero—you're setting it to your intended value.
+
+</div>
+</details>
 
 To create a mapping from virtual address V to physical address P with permissions PERM:
 
@@ -273,11 +305,16 @@ To create a mapping from virtual address V to physical address P with permission
 
 The PPN is shifted left by 10 because the PPN field starts at bit 10 of the PTE (bits 0-9 are the flags).
 
-### Unmapping
+<details>
+<summary>When you unmap a page, should you free the underlying physical frame? What about page table pages?</summary>
+<div>
 
-To remove a mapping: set the PTE's V bit to 0 (or set the entire PTE to 0). Don't forget to free the physical frame if it's no longer needed. Also don't forget `sfence.vma`.
+Free the physical frame (the data page) only if it's no longer referenced elsewhere. Free page table pages only if all their entries become invalid—this is optional for the kernel page table but important for process cleanup on exit. Don't forget `sfence.vma` after unmapping.
 
-If all entries in a page table page become invalid, you can free that page table page too. This is optional and adds complexity — most OS implementations don't bother for the kernel page table but do it for process page tables when processes exit.
+</div>
+</details>
+
+To remove a mapping: set the PTE's V bit to 0 (or set the entire PTE to 0).
 
 ---
 
@@ -313,12 +350,14 @@ On a page fault:
 - `sepc` contains the address of the faulting instruction
 - `stval` contains the **faulting virtual address** — the address that couldn't be translated
 
-Page faults are not always errors. In a fully-featured OS, page faults are used for:
-- **[Demand paging](https://en.wikipedia.org/wiki/Demand_paging):** Don't allocate physical frames until the process actually accesses the page. Map the page as invalid initially. When the process touches it, the page fault handler allocates a frame, maps it, and retries the instruction. This saves memory for pages that are allocated but never used.
-- **[Copy-on-write (COW)](https://en.wikipedia.org/wiki/Copy-on-write):** After `fork()`, parent and child share physical frames with read-only permissions. When either writes to a shared page, a page fault triggers, the handler copies the frame, gives each process its own copy, makes both writable, and retries. This makes `fork()` fast for programs that don't modify much memory.
-- **[Swapping](https://en.wikipedia.org/wiki/Memory_paging):** When physical memory is full, evict a page to disk and mark it invalid. When the process accesses it, the page fault handler reads it back from disk.
+<details>
+<summary>Are page faults always errors, or can they be useful?</summary>
+<div>
 
-For your initial OS, page faults are errors — they mean you have a bug in your page table setup. Print the fault type, `sepc`, and `stval`, then panic. Later, you can add demand paging or COW if you want.
+Page faults are useful in production systems. **Demand paging** allocates frames only when accessed. **Copy-on-write** shares pages until written, making fork() fast. **Swapping** moves pages to disk when memory fills. For your teaching OS, treat page faults as bugs in page table setup and panic.
+
+</div>
+</details>
 
 ---
 

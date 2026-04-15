@@ -22,7 +22,22 @@ The key concept in virtio is the **[virtqueue](https://docs.oasis-open.org/virti
 
 ### The Virtqueue
 
-A [virtqueue](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html) consists of three areas in memory, allocated by the driver:
+<details>
+<summary>Why does virtio use three separate memory areas instead of a single shared buffer?</summary>
+<div>
+
+A [virtqueue](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html) consists of three separate areas in memory, allocated by the driver. Using three separate areas prevents races and allows each component to operate independently without interfering with the others:
+
+- The **descriptor table** allows the driver to describe multiple request buffers.
+- The **available ring** lets the driver submit request heads without the device reading incomplete descriptors.
+- The **used ring** lets the device signal completion without overwriting pending requests.
+
+If a single shared buffer was used, the driver and device would need to coordinate reads and writes, making it easy to create race conditions where one side overwrites data the other is reading.
+
+</div>
+</details>
+
+The three areas are:
 
 **1. Descriptor Table:** An array of descriptors. Each descriptor describes a buffer (address, length, flags). A single I/O operation may involve multiple buffers chained together as a [descriptor chain](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html) (e.g., a "read block" operation has a header buffer, a data buffer, and a status buffer).
 
@@ -58,12 +73,19 @@ struct virtq_used {
 };
 ```
 
-### The I/O Cycle
+<details>
+<summary>Why is the available ring incremented after writing the descriptor, not before?</summary>
+<div>
+
+The I/O Cycle:
 
 1. **Driver allocates descriptors** for the request: one for the command header, one for the data buffer, one for the status byte. Chain them using the `next` field.
 2. **Driver writes** the head descriptor index to the available ring.
 3. **Driver increments** `avail->idx`.
 4. **Driver notifies** the device by writing to a notification register (MMIO).
+
+The order is critical. If the increment happened before the write, the device might see the new index and try to read a descriptor before the driver has written it. By writing the descriptor first, then incrementing, the driver ensures the device sees a complete, coherent request.
+
 5. **Device processes** the request (reads/writes the disk image).
 6. **Device writes** the completed descriptor index to the used ring.
 7. **Device sends an interrupt.**
@@ -71,17 +93,15 @@ struct virtq_used {
 
 This asynchronous model is fundamental to all modern I/O: submit a request, do other work, handle the completion later. It's how [NVMe](https://en.wikipedia.org/wiki/NVMe) drives, [network cards](https://en.wikipedia.org/wiki/Network_interface_controller), and GPU command queues all work. Virtio is a simple, clean version of this pattern.
 
-> **Aside: Why virtio instead of emulating a real disk controller?**
->
-> QEMU can emulate real hardware (e.g., an [Intel AHCI SATA](https://en.wikipedia.org/wiki/Advanced_Host_Controller_Interface) controller or an [IDE disk](https://en.wikipedia.org/wiki/Parallel_ATA)). The problem is that real hardware has complex, historical interfaces that require large, complex drivers. An IDE driver alone can be hundreds of lines to handle all the quirks. AHCI is worse.
->
-> Virtio is designed to be simple to drive while being efficient. The driver needs to understand the [virtqueue protocol](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html) and the device-specific header format, but there's no hardware-specific initialization sequence, no register-level timing constraints, and no legacy compatibility modes. It's the ideal device for a teaching OS.
->
-> That said, understanding virtio is directly relevant to real-world systems: Linux uses virtio extensively in [KVM](https://en.wikipedia.org/wiki/Kernel-based_Virtual_Machine) virtual machines, cloud VMs (AWS, GCP, Azure all use virtio for block and network devices), and even some bare-metal configurations.
+</div>
+</details>
+
 
 ---
 
-## MMIO Discovery
+<details>
+<summary>How does the driver know where virtio devices are?</summary>
+<div>
 
 On the QEMU `virt` machine, virtio devices are exposed as [MMIO](https://en.wikipedia.org/wiki/Memory-mapped_I/O) regions starting at `0x10001000`. Each device occupies a 0x1000-byte region. The first virtio device is at `0x10001000`, the second at `0x10002000`, and so on.
 
@@ -92,11 +112,16 @@ To discover virtio devices, the driver reads the **magic number** and **device I
 - Offset 0x008: Device ID (1 = network, 2 = block, etc.)
 - Offset 0x00C: Vendor ID
 
-If the magic value is correct and the device ID is 2 (block device), you've found a virtio-blk device.
+If the magic value is correct and the device ID is 2 (block device), you've found a virtio-blk device. This simple magic-number-based discovery allows the kernel to probe MMIO space and identify devices without a separate device tree or PCI bus.
 
-### Device Initialization
+</div>
+</details>
 
-The virtio MMIO initialization sequence:
+<details>
+<summary>Why is the virtio initialization sequence so rigid?</summary>
+<div>
+
+The virtio MMIO initialization sequence must be followed precisely:
 
 1. **Reset the device** (write 0 to the Status register at offset 0x070)
 2. **Set ACKNOWLEDGE** status bit (write 1)
@@ -111,7 +136,12 @@ The virtio MMIO initialization sequence:
    - Write their physical addresses to the appropriate registers
 8. **Set DRIVER_OK** status bit (write 15 — 0xF)
 
+Each step communicates driver state to the device, allowing both to reach a synchronized view of what's configured. If you skip steps or go out of order, the device may not initialize correctly or may misinterpret the configuration. This handshake ensures both driver and device agree on the features being used and the memory layout.
+
 After step 8, the device is ready to accept I/O requests.
+
+</div>
+</details>
 
 ---
 
@@ -128,8 +158,15 @@ struct virtio_blk_req_header {
 };
 ```
 
+<details>
+<summary>Why is the data buffer marked VIRTQ_DESC_F_WRITE for reads?</summary>
+<div>
+
 **Descriptor 1: Data Buffer**
-The buffer to read into (for reads) or write from (for writes). Must be `sector_count * 512` bytes. Mark with VIRTQ_DESC_F_WRITE flag if the device should write to it (i.e., for read operations — the device writes data into your buffer via [DMA](https://en.wikipedia.org/wiki/Direct_memory_access)).
+The buffer to read into (for reads) or write from (for writes). Must be `sector_count * 512` bytes. Mark with VIRTQ_DESC_F_WRITE flag if the device should write to it. For read operations, the device writes data into your buffer via [DMA](https://en.wikipedia.org/wiki/Direct_memory_access). The VIRTQ_DESC_F_WRITE flag means "the device is going to write to this buffer," not "the buffer contains write data." The naming is from the device's perspective, not the operation's name.
+
+</div>
+</details>
 
 **Descriptor 2: Status Byte**
 A single byte that the device writes with the completion status: 0 = OK, 1 = I/O error, 2 = unsupported. Mark with VIRTQ_DESC_F_WRITE.
@@ -167,13 +204,18 @@ This creates a 16 MiB raw disk image filled with zeros. Your driver can read and
 
 ---
 
-## Synchronous vs. Asynchronous I/O
+<details>
+<summary>Why start with a synchronous driver instead of interrupt-driven?</summary>
+<div>
 
 For simplicity, your initial driver can be **synchronous**: submit a request, then busy-wait (or sleep) until the device completes it. This is simpler but blocks the calling process until I/O finishes.
 
 An **asynchronous** driver submits the request, returns immediately, and handles completion in an interrupt handler. The calling process can be put to sleep and woken when the I/O completes. This is how production drivers work and is essential for good performance.
 
-For your teaching OS, start synchronous (poll the used ring after each request). Once it works, convert to interrupt-driven.
+For your teaching OS, start synchronous (poll the used ring after each request). Once it works, convert to interrupt-driven. This approach separates concerns: first get the basic I/O protocol working, then add the complexity of interrupt handling.
+
+</div>
+</details>
 
 ---
 

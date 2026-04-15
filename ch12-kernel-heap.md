@@ -31,6 +31,15 @@ Each block (allocated or free) has a header that records its size. Free blocks a
 
 The header is typically 16 bytes on a 64-bit system: 8 bytes for the size, 8 bytes for the next pointer (or some combined structure).
 
+<details>
+<summary>How does the allocator find the header when `kfree(ptr)` is called?</summary>
+<div>
+
+The header is stored immediately before the usable memory. `kfree` subtracts a fixed offset (the header size) from the returned pointer to find it. This requires the caller to pass the exact pointer that `kmalloc` returned; any modification breaks the lookup.
+
+</div>
+</details>
+
 When `kmalloc(48)` is called:
 1. Walk the free list looking for a block of at least 48 bytes
 2. If the block is much larger than needed, **split** it: carve out 48 bytes (plus header) and leave the rest as a smaller free block
@@ -42,57 +51,54 @@ When `kfree(ptr)` is called:
 3. Add it to the free list
 4. **Coalesce** with adjacent free blocks if possible (merge two neighboring free blocks into one larger block)
 
-### Splitting
+<details>
+<summary>Why split blocks instead of returning the entire block, and what's the minimum block size?</summary>
+<div>
 
-Without splitting, every allocation returns the first block that's big enough, regardless of how much space is wasted. A 48-byte allocation from a 4096-byte block wastes 4048 bytes (internal [fragmentation](https://en.wikipedia.org/wiki/Fragmentation_(computing))).
+Without splitting, a 48-byte request from a 4096-byte block wastes 4048 bytes (internal fragmentation). Splitting carves the block into two pieces—one for the request, one for the remainder. The minimum block size is the header size (so the block can hold its header when free). Most implementations use 16-32 bytes as the minimum.
 
-With splitting, the allocator carves the block into two pieces: one of the requested size (plus header) and one containing the remainder. Both have headers. The remainder goes back on the free list.
+</div>
+</details>
 
-Splitting requires a minimum block size — there's no point creating a free block of 0 usable bytes. The minimum block size is typically the header size (so the block can at least hold the header when free). On most implementations, the minimum allocation unit is 16 or 32 bytes.
+<details>
+<summary>What is coalescing, and how do you efficiently find adjacent free blocks to merge?</summary>
+<div>
 
-### Coalescing
+Coalescing merges physically adjacent free blocks to combat fragmentation. To find neighbors, you can use boundary tags (copy the size at both ends—constant time), sequential scan (walk the free list—O(n)), or implicit free lists (walk all blocks sequentially—simpler but O(n) for allocation). For a teaching OS, the implicit free list with splitting and coalescing balances simplicity and correctness.
 
-Without coalescing, the free list accumulates many small free blocks that are physically adjacent but logically separate. A program that allocates 100 blocks of 32 bytes and frees them all ends up with 100 free blocks of 32 bytes, not one free block of 3200 bytes. A subsequent request for 256 bytes fails because no single free block is large enough.
+</div>
+</details>
 
-**[Coalescing](https://en.wikipedia.org/wiki/Memory_management#Fragmentation)** merges adjacent free blocks. When freeing a block, check if the block immediately before or after it is also free. If so, merge them into one larger block. This combats **[fragmentation](https://en.wikipedia.org/wiki/Fragmentation_(computing))** — the tendency for free memory to be broken into small, unusable pieces.
+<details>
+<summary>Why do production kernels use slab allocators instead of simple free lists?</summary>
+<div>
 
-Coalescing adjacent blocks requires knowing where the neighboring blocks are. There are several approaches:
+Most kernel allocations are fixed-size (task structs, inodes, buffer heads, etc.). Slab allocators pre-allocate pools for each type—no splitting, no coalescing, no fragmentation. They layer on top of the page allocator just like your heap layers on the frame allocator. For a teaching OS, a simple free list works fine.
 
-**Boundary tags:** Each block has a header at the start AND a footer at the end (a copy of the size). To find the previous block, read the footer immediately before your header. To find the next block, use your size to compute the address of the next header. This enables constant-time coalescing but adds overhead (the footer).
-
-**Sequential scan:** Walk the free list to find neighbors. Simple but O(n) in the number of free blocks.
-
-**Implicit free list:** Don't maintain an explicit linked list of free blocks. Instead, walk through all blocks (free and allocated) sequentially using the size field in each header. This is simpler but makes allocation O(n) in the total number of blocks.
-
-For a teaching OS, the implicit free list with splitting and coalescing is the best balance of simplicity and correctness. It's the algorithm taught in CS:APP Chapter 9.9, and it works well for kernels that don't allocate millions of small objects.
-
-> **Aside: Slab allocation**
->
-> The Linux kernel uses a more sophisticated allocator called the **[slab allocator](https://en.wikipedia.org/wiki/Memory_pool#Slab_allocation)** (and its successors SLUB and SLOB). The idea: most kernel allocations are for a small number of fixed-size object types (task structs, inode structs, buffer heads, etc.). The slab allocator pre-allocates pools of objects of each type. Allocating a task struct just pops one from the task struct pool. Freeing it pushes it back. No splitting, no coalescing, no fragmentation.
->
-> The slab allocator is layered on top of the page allocator (buddy system), just as your heap is layered on top of the frame allocator. The difference is in the fragmentation characteristics and performance for repeated same-size allocations.
->
-> For a teaching OS, a simple free list is sufficient. If you notice fragmentation becoming a problem (it probably won't at this scale), you could implement a simple slab allocator for your most-allocated struct type.
->
-> [OSTEP Chapter 17](https://pages.cs.wisc.edu/~remzi/OSTEP/vm-freespace.pdf) discusses slab allocation. Bonwick's original paper, "[The Slab Allocator: An Object-Caching Kernel Memory Allocator](https://www.usenix.org/proceedings/summer-1994/bonwick)" (1994), is a classic and very readable.
+</div>
+</details>
 
 ---
 
-## Growing the Heap
+<details>
+<summary>When should the heap request new pages from the frame allocator, and can the heap shrink?</summary>
+<div>
 
-When the free list has no block large enough for a request, the allocator needs more memory. It requests a page (or multiple pages) from the frame allocator using `kalloc()`, adds the page to the heap's managed region, and creates a free block covering the new page. Then it retries the allocation.
+The heap requests pages on-demand when no free block is large enough—it starts small and grows as needed. It can potentially shrink by returning pages to the frame allocator when they're entirely free, but most implementations don't bother. If you have a direct map, you can allocate pages and access them without additional page table entries.
 
-This means the heap grows on demand: it starts empty and requests pages as needed. It can also potentially shrink (return pages to the frame allocator when they're entirely free), though most simple implementations don't bother.
-
-The heap occupies a region of the kernel's virtual address space. You should designate a range — say, `KERNEL_HEAP_START` to `KERNEL_HEAP_END` — and map new pages into this range as the heap grows. Alternatively, since you have a direct map of all physical memory, you can allocate physical pages and access them through the direct map without additional page table entries.
+</div>
+</details>
 
 ---
 
-## Alignment
+<details>
+<summary>Why must `kmalloc` return aligned addresses, and how do you ensure alignment?</summary>
+<div>
 
-`kmalloc` should return addresses aligned to at least 8 bytes (on a 64-bit system) so that any data type can be stored at the returned address without alignment issues. Many implementations align to 16 bytes for compatibility with SIMD and atomic operations.
+Alignment ensures any data type can be stored at the returned address without issues. A 16-byte header naturally aligns the usable area to 16 bytes (on 64-bit systems) if the block starts 16-byte-aligned. This is why many implementations use 16-byte headers instead of smaller ones.
 
-Your header size naturally provides alignment if it's a multiple of 8 or 16 bytes. If you design the header to be 16 bytes, and place the usable area immediately after the header, the usable area will be 16-byte aligned as long as the block itself starts at a 16-byte-aligned address.
+</div>
+</details>
 
 ---
 

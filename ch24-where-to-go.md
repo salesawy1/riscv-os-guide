@@ -37,6 +37,15 @@ Here's what we didn't build, organized by topic. Each section includes what the 
 - Handle inter-processor interrupts (IPIs) via the CLINT
 - Make the scheduler SMP-aware (per-core run queues or a global run queue with locking)
 
+<details>
+<summary>Why is adding SMP support so much harder than single-core scheduling?</summary>
+<div>
+
+On a single core, if two pieces of code try to modify the same data structure, you can rely on interrupts being disabled or context switches being controlled. On multicore, two cores can truly execute simultaneously. Without locks, one core's write can race with another's read, corrupting shared data. Every shared data structure must have explicit synchronization, and lock ordering must be correct to avoid deadlocks where two cores wait forever holding locks the other needs.
+
+</div>
+</details>
+
 **Difficulty:** High. The hard part isn't waking the cores — it's the concurrency. Every shared data structure needs synchronization, and lock ordering becomes critical to avoid deadlocks.
 
 **Resources:**
@@ -56,6 +65,15 @@ Here's what we didn't build, organized by topic. Each section includes what the 
 - On fault: allocate a frame, map it, return to retry the instruction
 - For `exec`: load the faulted page's data from the ELF file on demand
 
+<details>
+<summary>How does demand paging reduce memory usage without losing functionality?</summary>
+<div>
+
+A program's address space can be huge, but it typically uses only a fraction of it (the stack grows slowly, the heap is sparse). Demand paging lets you map the entire address space without allocating frames. When the program touches a page, the page fault handler allocates and maps a frame on the fly. Pages that are never touched never consume physical memory. This is why systems can oversubscribe memory — processes can have more virtual memory than physical RAM.
+
+</div>
+</details>
+
 **Difficulty:** Medium. The page fault handler is the tricky part — it must determine *why* the page wasn't mapped (lazy allocation? COW? truly invalid address?) and act accordingly.
 
 **Resources:**
@@ -74,6 +92,15 @@ Here's what we didn't build, organized by topic. Each section includes what the 
 - Page fault handler: if the fault is a write to a COW page, allocate a new frame, copy the data, update the PTE to writable, decrement the old frame's reference count
 - Frame allocator: add per-frame reference counts
 
+<details>
+<summary>Why is COW fork faster than copying all pages immediately?</summary>
+<div>
+
+Because most processes fork and then immediately exec (replacing their address space). Copying all pages takes time proportional to the process size. COW defers copying: pages are only copied if actually modified. Since exec discards the process's memory without writing to it, COW avoids the copy entirely. This makes fork O(1) in the common case. Only processes that fork and then mutate memory (instead of exec-ing) pay the copy cost, and only for pages they actually write.
+
+</div>
+</details>
+
 **Difficulty:** Medium-high. The reference counting must be correct, or you'll double-free frames or leak them.
 
 **Resources:**
@@ -90,6 +117,15 @@ Here's what we didn't build, organized by topic. Each section includes what the 
 - Signal delivery: set a flag in the process's PCB
 - Signal handling: check the flag on return from kernel to user. If a signal is pending, divert execution to the signal handler (modify the trap frame to jump to the handler, with a trampoline to return to normal execution afterward)
 - Signal masks, default handlers, `sigaction`
+
+<details>
+<summary>How does the OS interrupt a process to deliver a signal?</summary>
+<div>
+
+Signals are fundamentally asynchronous — the process might be executing anywhere when the signal arrives (e.g., a SIGTERM from the user hitting Ctrl+C). The OS can't just call a function. Instead, on the next transition from kernel to user mode (return from a system call or timer interrupt), the kernel checks if a signal is pending. If so, it modifies the saved trap frame (the stack frame that will be restored on `sret`) to jump to the signal handler instead of the original instruction. After the handler runs, the trampoline jumps back to the kernel, which restores the original trap frame and returns to the original code. The process sees it as if the handler was called asynchronously.
+
+</div>
+</details>
 
 **Difficulty:** Medium. The tricky part is safely diverting user execution and returning afterward.
 

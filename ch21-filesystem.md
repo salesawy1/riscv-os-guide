@@ -71,11 +71,36 @@ The `direct` array holds block numbers for the first 12 blocks of the file. For 
 
 For larger files, the `indirect` pointer points to a **[block full of block pointers](https://wiki.osdev.org/Inode#Indirect_Blocks)**. With 512-byte blocks and 4-byte block numbers, an indirect block holds 128 pointers, adding 128 × 512 = 64 KiB of addressable data. Total maximum file size: 12 × 512 + 128 × 512 = 70 KiB.
 
-This is small by modern standards, but sufficient for a teaching OS. Real filesystems use double-indirect (pointer to a block of indirect blocks) and triple-indirect blocks, or extent trees (ext4), or B-trees (NTFS, btrfs).
+<details>
+<summary>Why use 12 direct pointers and then an indirect block, rather than just one approach?</summary>
+<div>
+
+Small files are the common case. Storing 12 direct pointers in the inode means files up to 6 KiB (the vast majority of files in a real system) can be accessed immediately without an extra disk read to fetch an indirect block. Only for larger files do you incur that extra read. It's a performance tradeoff: optimize for the common case.
+
+</div>
+</details>
+
+<details>
+<summary>Why not use a double-indirect block to support arbitrarily large files?</summary>
+<div>
+
+Simplicity. A double-indirect adds another level of indirection and more code complexity. For a teaching OS handling files up to 70 KiB, it's overkill. Real filesystems do use double and triple indirection (or modern structures like extent trees) because they need to handle files that are gigabytes or larger.
+
+</div>
+</details>
 
 ### Inode Numbers
 
 Each inode has an implicit number (its index in the inode table). The root directory is conventionally inode 1 (inode 0 is unused/reserved). When a directory entry refers to a file, it stores the file's inode number. When the kernel needs to access the file, it reads the inode from the inode table using the inode number.
+
+<details>
+<summary>Why store inode numbers in directory entries instead of full inode structures?</summary>
+<div>
+
+Inodes are larger than inode numbers (multiple cache lines vs. a few bytes). Storing only the inode number keeps directory entries small and fast to search. When you need the inode's metadata (size, timestamps, block pointers), you follow the number to the inode table. This separation of concerns — one table for names-to-numbers, another for numbers-to-metadata — makes the data structure simpler and more efficient.
+
+</div>
+</details>
 
 ---
 
@@ -100,11 +125,29 @@ To look up "/home/readme.txt":
 5. Search for an entry named "readme.txt" — it gives you inode number M
 6. Read inode M — it's a file. Its `direct` and `indirect` pointers tell you where the data is.
 
+<details>
+<summary>Why does pathname resolution require multiple disk reads for a nested path?</summary>
+<div>
+
+Each path component requires reading a directory's data blocks to find the next component. For "/home/readme.txt", you read the root directory to find "home", then read "home"'s directory data to find "readme.txt". There's no way around it without caching — the filesystem is hierarchical, and you must traverse the hierarchy. This is why the buffer cache is critical: after the first read, subsequent accesses to the same directory blocks are instant.
+
+</div>
+</details>
+
 This path traversal is called **[pathname resolution](https://pages.cs.wisc.edu/~remzi/OSTEP/file-intro.pdf)**, and it's one of the fundamental operations of any filesystem.
 
 ### Hard Links and nlink
 
 Multiple directory entries can point to the same inode — these are **[hard links](https://en.wikipedia.org/wiki/Hard_link)**. The `nlink` field in the inode counts how many directory entries refer to it. When `nlink` drops to 0 (and no process has the file open), the inode and its blocks can be freed.
+
+<details>
+<summary>Why does `nlink` need to be greater than 0 before freeing an inode?</summary>
+<div>
+
+If there are still directory entries pointing to the inode, deleting its blocks would leave those entries dangling — they'd refer to a freed inode. Only when all directory entries (including those created by `ln`) are gone is it safe to reclaim the inode's blocks. And you still need to check that no process has the file open, because an open file descriptor also holds a reference.
+
+</div>
+</details>
 
 The `.` entry in a directory points to the directory itself. The `..` entry points to the parent directory. These are hard links that exist in every directory.
 
@@ -121,6 +164,15 @@ To allocate a block:
 1. Scan the bitmap for a 0 bit
 2. Set it to 1
 3. Return the block number
+
+<details>
+<summary>Why use a bitmap to track free blocks instead of a linked list of free blocks?</summary>
+<div>
+
+A bitmap is compact (1 bit per block) and fast to scan with bitwise operations. A linked list would require following pointers through the free blocks, much slower. The bitmap is also more cache-friendly — you can check hundreds of blocks with a few memory accesses. The downside is that the bitmap itself must fit in memory or be cached, but that's a small price.
+
+</div>
+</details>
 
 To free a block:
 1. Set its bitmap bit to 0
@@ -149,6 +201,24 @@ The interface:
 - **`bread(blockno)`**: Read block from disk (or return cached copy)
 - **`bwrite(buf)`**: Write a modified buffer back to disk
 - **`brelse(buf)`**: Release a buffer (decrease reference count, make available for reuse)
+
+<details>
+<summary>Why does the buffer cache track a `valid` flag separately from the data?</summary>
+<div>
+
+A buffer structure is allocated before its data is read from disk. The `valid` flag indicates whether the data has actually been populated. Before reading, `valid=0`. After `bread` completes the I/O, `valid=1`. This lets you allocate and manage buffer structures independently of I/O completion.
+
+</div>
+</details>
+
+<details>
+<summary>Why does the buffer cache need a reference count and LRU eviction?</summary>
+<div>
+
+Many parts of the kernel may hold a pointer to a cached block simultaneously (the inode table read, a directory lookup, a file read). The reference count ensures you don't evict a buffer while someone is still using it. LRU eviction chooses the least recently used buffer because the working set of files typically accesses a locality set — blocks used recently tend to be used again soon.
+
+</div>
+</details>
 
 When the cache is full and a new block is needed, evict the least recently used (LRU) buffer. If it's dirty, write it back first.
 

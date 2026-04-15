@@ -39,11 +39,32 @@ x28-x31    t3-t6      Temporaries                       Caller
 
 Several things to internalize:
 
-**`x0` is [hardwired to zero](https://en.wikipedia.org/wiki/Zero_register).** Writing to it does nothing. Reading it always returns 0. This simplifies the instruction set: "move register A to register B" is just `add B, A, x0` (add A plus zero, store in B). "Load the value 0 into register A" is `add A, x0, x0`. There's no separate `mov` or `li` instruction in the base ISA — they're pseudoinstructions that the assembler translates into arithmetic with `x0`.
+<details>
+<summary>Why have a hardwired zero register?</summary>
+<div>
 
-**`ra` (return address) is just a register.** On x86, the return address is pushed onto the stack by the `call` instruction. On RISC-V, `jal` (jump and link) stores the return address in `ra` and jumps. The return address is in a register, not on the stack. The callee must save `ra` to the stack if it calls another function (because that function's `jal` would overwrite `ra`). Leaf functions — functions that don't call other functions — never need to touch the stack for the return address. This is cleaner and faster.
+A zero register is always available and doesn't consume a general-purpose register. It lets common operations (move, load zero) be encoded as simple arithmetic without dedicated instructions. `add B, A, x0` is a move. `add A, x0, x0` loads zero. This saves instruction encoding space — no need for separate `mov` or `li` instructions. The assembler provides pseudoinstructions that expand to this arithmetic.
 
-**`sp` (stack pointer) is just a register.** The hardware doesn't enforce anything about `sp`. It doesn't automatically push or pop. There's no hardware stack limit check. It's a general-purpose register that the software convention designates for stack use. If you corrupt `sp`, the CPU won't stop you — it'll just start reading and writing garbage memory for all subsequent function calls.
+</div>
+</details>
+
+<details>
+<summary>Why store the return address in a register instead of on the stack?</summary>
+<div>
+
+Storing `ra` in a register (not on the stack) means leaf functions (those that don't call others) never need a stack. The register return address is faster than pushing/popping. The trade-off: if a function calls another, it must save `ra` before the nested call overwrites it. This is a good trade-off because leaf functions are common, and the calling convention makes saving `ra` automatic.
+
+</div>
+</details>
+
+<details>
+<summary>If sp is just a register, what stops bugs from corrupting it?</summary>
+<div>
+
+Nothing. The hardware provides no protection. If you corrupt `sp`, the CPU happily continues, pushing and popping to random addresses. This is a trade-off: full flexibility for the OS developer, but full responsibility. Once you add virtual memory (Chapter 10), you can detect stack overflows with a guard page — but initially, it's on you to manage the stack carefully and avoid corruption.
+
+</div>
+</details>
 
 **`gp` (global pointer) and `tp` (thread pointer) are set once and left alone.** `gp` is used for relaxed addressing of global variables (linker relaxation). `tp` is used for thread-local storage. In a multicore OS, each core's `tp` would point to that core's per-CPU data structure. For our single-core OS, we'll set `tp` and use it to identify the current process or hart.
 
@@ -59,9 +80,16 @@ Several things to internalize:
 
 ## Instruction Encoding
 
-You won't need to encode instructions by hand — the assembler does that. But understanding the encoding helps you read disassembly and appreciate why RISC-V instructions look the way they do.
+<details>
+<summary>Why does RISC-V have such a regular instruction encoding?</summary>
+<div>
 
-RISC-V instructions are 32 bits wide (the base ISA; the "C" extension adds 16-bit compressed instructions). The lowest 7 bits are the **opcode**, which identifies the instruction type. The encoding is extremely regular — register fields are always in the same bit positions:
+Regular encoding lets the hardware decode in parallel: the control logic can extract register numbers (`rd`, `rs1`, `rs2`) from fixed bit positions before even determining which instruction it is. This simplifies the CPU pipeline and enables faster execution. The trade-off is that some fields (immediate values) get scattered across the instruction in non-obvious ways, but the assembler handles that.
+
+</div>
+</details>
+
+RISC-V instructions are 32 bits wide (the base ISA; the "C" extension adds 16-bit compressed instructions). The lowest 7 bits are the **opcode**, which identifies the instruction type.
 
 ```
 Bits:  31       25 24   20 19   15 14  12 11    7 6      0
@@ -357,22 +385,14 @@ The S-mode CSRs mirror the M-mode ones, but for S-mode trap handling:
 | `sscratch` | 0x140 | `mscratch` | Scratch register for S-mode trap handlers |
 | `satp` | 0x180 | (none) | **Supervisor Address Translation and Protection** — THE virtual memory control register |
 
-The most important one here is **`satp`**. It has no M-mode equivalent because M-mode always uses physical addresses. `satp` controls the MMU:
+<details>
+<summary>What happens when you write to satp?</summary>
+<div>
 
-```
-Bits    Field    Meaning
-─────   ─────    ───────
-63:60   MODE     Address translation mode:
-                 0 = Bare (no translation)
-                 8 = Sv39 (39-bit virtual address, 3-level page table)
-                 9 = Sv48 (48-bit virtual address, 4-level page table)
+Writing to `satp` with a non-zero MODE and a PPN tells the MMU to activate virtual memory. Every subsequent memory access goes through the page table rooted at that address. This is one single write that transforms the CPU from bare-metal to virtual-memory mode. It's consequential and error-prone — if the page table is invalid, the next memory access causes a fault. This is why Chapter 10 covers it thoroughly.
 
-59:44   ASID     Address Space Identifier (for TLB tagging)
-
-43:0    PPN      Physical Page Number of the root page table
-```
-
-Writing to `satp` enables or changes the page table. When you write a non-zero MODE and a PPN, the MMU starts translating every subsequent memory access through the page table rooted at the given physical address. This is one of the most consequential single-register writes in your entire OS. We'll cover it thoroughly in Chapter 10.
+</div>
+</details>
 
 `sstatus` is not a separate register — it's a *view* (restricted projection) of `mstatus`. Reading `sstatus` in S-mode returns a subset of `mstatus` fields (SIE, SPIE, SPP, etc.), and writing to `sstatus` modifies those same bits in `mstatus`. The M-mode-only fields are hidden from S-mode.
 
@@ -555,7 +575,14 @@ If you've been exposed to other architectures, here's how RISC-V maps:
 | Condition flags | None (compare-and-branch) | RFLAGS (ZF, CF, etc.) | NZCV |
 | Register count | 32 GPRs | 16 GPRs | 31 GPRs |
 
-The most significant conceptual difference for OS development: x86 uses an **[Interrupt Descriptor Table](https://en.wikipedia.org/wiki/Interrupt_descriptor_table)** (a data structure in memory pointed to by the IDTR register) to map interrupt numbers to handler addresses. RISC-V uses a single trap vector (`mtvec`/`stvec`) that points to one handler; the handler itself dispatches based on the cause. ARM is closer to RISC-V's model.
+<details>
+<summary>What's the difference between RISC-V's mtvec and x86's IDT?</summary>
+<div>
+
+x86 has a 256-entry table (IDT) in memory, indexed by interrupt number, each entry pointing to a handler. RISC-V has a single `mtvec` register pointing to one handler that examines `mcause` to dispatch. RISC-V's approach is simpler (one trap vector, no table), but x86's IDT lets different interrupt types jump directly to their handlers (faster). RISC-V's vectored mode (`mtvec` mode 1) partially recovers this: it adds 4 × cause to the base address to jump to cause-specific handlers.
+
+</div>
+</details>
 
 ---
 

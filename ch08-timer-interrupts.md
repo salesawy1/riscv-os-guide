@@ -27,17 +27,27 @@ The timer on the QEMU `virt` machine is part of the **[CLINT](https://sifive.cdn
 
 [`mtime`](https://github.com/riscv/riscv-isa-manual/releases/download/Priv-v1.12/riscv-privileged-20211203.pdf) is a 64-bit register at CLINT base + `0xBFF8`. It's a free-running counter that increments at a fixed frequency. On the QEMU `virt` machine, `mtime` increments at 10 MHz (10,000,000 ticks per second). This frequency is specified in the device tree and is a property of the platform.
 
-Key properties of `mtime`:
-- It **never stops**. It counts up continuously from reset, regardless of what the CPU is doing.
-- It's **shared** across all harts on the same CLINT. All cores see the same value.
-- It's **read-only** from the OS's perspective (technically it's read-write, but writing to it is unusual and discouraged).
-- It wraps around at 2^64, which at 10 MHz takes about 58,000 years. You won't see it wrap.
+<details>
+<summary>Why is `mtime` shared across all harts but `mtimecmp` is per-hart?</summary>
+<div>
+
+`mtime` is a global free-running counter — all harts see the same value. But each hart needs independent timer compare registers (`mtimecmp`). This lets each core schedule its own timer interrupt at a different time. `mtime` never stops, is read-only for practical purposes, and wraps at 2^64 (in ~58,000 years at 10 MHz — not your problem).
+
+</div>
+</details>
 
 ### mtimecmp: The Comparator
 
 [`mtimecmp`](https://github.com/riscv/riscv-isa-manual/releases/download/Priv-v1.12/riscv-privileged-20211203.pdf) is a 64-bit register, one per hart, at CLINT base + `0x4000 + 8 * hartid`. For hart 0, that's `0x02004000`.
 
-When `mtime >= mtimecmp`, a **machine timer interrupt** becomes pending. The interrupt is signaled in [`mip`](https://github.com/riscv/riscv-isa-manual/releases/download/Priv-v1.12/riscv-privileged-20211203.pdf) (bit 7, MTIP — Machine Timer Interrupt Pending) and, if enabled in [`mie`](https://github.com/riscv/riscv-isa-manual/releases/download/Priv-v1.12/riscv-privileged-20211203.pdf) (bit 7, MTIE — Machine Timer Interrupt Enable) and globally enabled in [`mstatus`](https://github.com/riscv/riscv-isa-manual/releases/download/Priv-v1.12/riscv-privileged-20211203.pdf) (MIE bit), causes a trap.
+<details>
+<summary>What's the difference between MTIP, MTIE, and MIE?</summary>
+<div>
+
+MTIP (Machine Timer Interrupt Pending) in `mip` is set by hardware when `mtime >= mtimecmp`. MTIE (Machine Timer Interrupt Enable) in `mie` is a per-interrupt-source enable gate. MIE (global Machine Interrupt Enable) in `mstatus` is the global gate. All three must be true for a timer interrupt to trap: MTIP must be pending, MTIE must be enabled, and MIE (global) must be enabled.
+
+</div>
+</details>
 
 To set up a timer interrupt N ticks from now:
 1. Read `mtime` to get the current value
@@ -114,23 +124,27 @@ The return path is critical: the trap handler returns normally, the assembly res
 
 ### The Tick Counter
 
-A global variable tracking the number of timer interrupts since boot is invaluable:
+<details>
+<summary>Why must the tick counter be `volatile`?</summary>
+<div>
 
-- It gives you a rough sense of time (`ticks * interval / clock_frequency = seconds since boot`)
-- It's the basis for `sleep()` (sleep until tick counter reaches a target value)
-- It's the [scheduling quantum](https://en.wikipedia.org/wiki/Time_slice) (switch processes every N ticks)
+The interrupt handler modifies `ticks` asynchronously while main code reads it. Without `volatile`, the compiler might cache the value in a register after the first read. Code like `while (ticks < target) {}` would loop forever because the compiler never re-reads the variable. `volatile` tells the compiler: this memory changes unexpectedly, check it every time.
 
-Make the tick counter [`volatile`](https://en.wikipedia.org/wiki/Volatile_(computer_programming)) — it's modified by the interrupt handler and read by the main execution context. Without `volatile`, the compiler might cache the value in a register and never re-read it, causing code like `while (ticks < target) {}` to loop forever.
+</div>
+</details>
 
 ---
 
 ## 64-bit MMIO Access on 32-bit Buses
 
-A subtle hardware concern: `mtime` and `mtimecmp` are 64-bit registers. On a 64-bit system (RV64), you can read and write them with a single `ld`/`sd` instruction. On a 32-bit system (RV32), you'd need two 32-bit accesses, which creates a [race condition](https://en.wikipedia.org/wiki/Race_condition): `mtime` could increment between your two reads, giving you a [torn read](https://en.wikipedia.org/wiki/Data_race#Torn_reads) (upper half from time T, lower half from time T+1).
+<details>
+<summary>Why is 64-bit MMIO access potentially dangerous on RV32?</summary>
+<div>
 
-The standard solution for RV32 is to read the upper half, read the lower half, read the upper half again, and if it changed, repeat. We're on RV64, so this isn't our problem — but it's worth knowing about if you ever port to RV32.
+On RV32, you need two 32-bit reads to get a 64-bit value. If `mtime` increments between your low-word and high-word reads, you get a "torn read" — upper half from one moment, lower half from another. Standard solution: read high, read low, read high again; if high changed, retry. RV64 avoids this — single `ld` instruction is atomic. Use `volatile uint64_t *` pointers.
 
-On RV64, just use `uint64_t *` pointers (with [`volatile`](https://en.wikipedia.org/wiki/Volatile_(computer_programming))) and let the compiler generate `ld`/`sd` instructions. Clean and atomic.
+</div>
+</details>
 
 ---
 
@@ -151,9 +165,14 @@ Timer interrupt handler:
 
 With a 100 ms interval, you'll see `[tick 10]` every second, `[tick 20]` every 2 seconds, etc.
 
-**Warning:** Printing inside an interrupt handler is generally bad practice in production code. `kprintf` calls `uart_putc`, which busy-waits. If the UART is slow, your interrupt handler blocks, potentially causing missed interrupts or delaying the return to the interrupted code. For testing, it's fine. For production, the interrupt handler should set a flag, and the main loop should check the flag and print.
+<details>
+<summary>Why is printing inside an interrupt handler problematic on real hardware?</summary>
+<div>
 
-On QEMU, `uart_putc` is effectively instant, so printing in the handler works. On real hardware, you'd want a more disciplined approach.
+`kprintf` calls `uart_putc`, which busy-waits on LSR. If the UART is slow, the handler blocks, delaying return to the interrupted code. This can cause missed interrupts or jitter in timing. On QEMU, UART operations are instant, so it's fine for testing. On real hardware, the handler should set a flag and return quickly; the main loop checks the flag and prints later.
+
+</div>
+</details>
 
 ### Verifying Timing
 
@@ -187,9 +206,14 @@ One `[tick]` line per second (if printing every 10 ticks at 100 ms each). The ke
 
 ## Interrupts and Concurrency: A Warning
 
-Now that you have interrupts firing asynchronously, you have the beginnings of [concurrency](https://en.wikipedia.org/wiki/Concurrency_(computer_science)), even on a single core. The interrupt handler runs at arbitrary points in your code's execution. This means:
+<details>
+<summary>What's the difference between a race condition and a volatile variable?</summary>
+<div>
 
-**Shared data must be protected.** If your main code and your interrupt handler both access the same global variable, you have a [race condition](https://en.wikipedia.org/wiki/Race_condition). For a simple tick counter, [`volatile`](https://en.wikipedia.org/wiki/Volatile_(computer_programming)) is sufficient (reads and writes of aligned 64-bit values are atomic on RV64). For more complex shared data structures, you'll need to disable interrupts around critical sections:
+Interrupts create concurrency: the handler runs at unpredictable times in your main code. If both access the same global, you have a race condition — one might read a partially-updated value. For a simple tick counter, `volatile` (and natural 64-bit atomicity on RV64) is sufficient. For complex data structures, you need synchronization — disabling interrupts around critical sections or using locks.
+
+</div>
+</details>
 
 ```
 // In your main code:
@@ -200,7 +224,14 @@ enable_interrupts();    // set mstatus.MIE
 
 This is the simplest form of [mutual exclusion](https://en.wikipedia.org/wiki/Mutual_exclusion): no other code can run while interrupts are disabled. It's crude but effective for a single-core system. On multicore, you'd need actual locks ([spinlocks](https://en.wikipedia.org/wiki/Spinlock)), because disabling interrupts on one core doesn't prevent another core from accessing the data.
 
-**Keep interrupt handlers short.** While your timer interrupt handler is running, interrupts are disabled (the hardware cleared `MIE` on trap entry). This means the CPU can't respond to other events — UART input is missed, other devices are ignored. Your handler should do the minimum necessary (update `mtimecmp`, increment a counter, set a flag) and return quickly. Long-running work triggered by the interrupt should be deferred to the main execution context.
+<details>
+<summary>What happens if an interrupt handler takes a long time to run?</summary>
+<div>
+
+While your handler runs, interrupts are disabled (hardware cleared `MIE` at trap entry). The CPU can't respond to other events — UART input is missed, other devices ignored. Long handlers cause unpredictable delays and missed interrupts. Handlers should do minimum work (update `mtimecmp`, increment a counter, set a flag) and return quickly. Deferred long work to the main execution context.
+
+</div>
+</details>
 
 ---
 
