@@ -1,0 +1,542 @@
+# Chapter 3: How Computers Boot
+
+**[Difficulty: ★★☆☆☆]**
+
+---
+
+## Why This Chapter Exists
+
+You press the power button. A few seconds later, your operating system is running. What happened in between?
+
+If you've never thought about this question, you're in the majority. Application developers — and even most systems programmers — treat booting as a black box. Power goes in, OS comes out. But you're about to write an operating system, and that means *your code* is somewhere in that sequence. You need to understand exactly where, and everything that happens before and after.
+
+This chapter traces the entire boot process, from the moment voltage stabilizes on the chip to the moment your `kernel_main()` function begins executing. We'll cover what the hardware does automatically, what firmware does, what a bootloader does, and where your kernel fits into this chain. By the end, you'll understand why the first instruction your CPU executes is at a fixed address, why firmware exists, what it does for you (or what *you* have to do without it), and why the QEMU `-bios none -kernel` invocation we're using both simplifies and complicates your life.
+
+Understanding the boot process isn't just academic curiosity. When your kernel fails to start — and it will, many times — you need to know *which stage* failed. Was the problem in your linker script? Did the CPU never reach your code? Did it reach your code but crash before producing any output? The boot process is a pipeline, and debugging it requires knowing the stages.
+
+---
+
+## The Reset Vector: Where It All Begins
+
+When a CPU receives power — or is reset — it doesn't start executing from some random location. It begins at a *fixed, hardwired address* called the **[reset vector](https://en.wikipedia.org/wiki/Reset_vector)**. This address is burned into the silicon. It is not configurable. It is not negotiable. The hardware designers chose it, and every piece of software in the system must respect it.
+
+On RISC-V, the reset vector is implementation-defined — different chips can use different addresses. The RISC-V specification does *not* mandate a universal reset vector (unlike x86, which always starts at `0xFFFFFFF0`, or ARM Cortex-M, which reads the initial stack pointer and entry point from address `0x00000000`). Each RISC-V implementation declares its own.
+
+For the QEMU `virt` machine, the reset vector is `0x1000`. That's where the CPU's program counter (`pc`) points when it comes out of reset. At that address, QEMU places a small sequence of instructions — a few machine words — that the CPU begins executing immediately.
+
+But wait. Your kernel is loaded at `0x80000000`. The CPU starts at `0x1000`. What's at `0x1000`, and how does execution get from there to your kernel?
+
+### What QEMU Places at the Reset Vector
+
+When you use `-bios none`, QEMU places a tiny trampoline at the reset vector. This trampoline does approximately two things:
+
+1. It loads the address `0x80000000` (or whatever address the `-kernel` ELF's entry point specifies) into a register.
+2. It jumps to that address.
+
+That's it. A handful of instructions. Their only purpose is to redirect the CPU from the hardwired reset vector to the actual start of your kernel. QEMU essentially says: "I know the CPU starts at `0x1000`, but the user wants to run code at `0x80000000`, so I'll put a trampoline here to bridge the gap."
+
+When you use `-bios default` (which is what happens if you omit `-bios`), QEMU instead loads OpenSBI firmware at `0x80000000` and places a trampoline that jumps there. OpenSBI then does its thing and eventually jumps to *your* kernel, which it expects at a different address (typically `0x80200000`, though this is configurable). We're skipping OpenSBI for now, so let's focus on the `-bios none` path.
+
+The key insight: **the CPU doesn't know or care what's at the reset vector.** It fetches the instruction at that address and executes it. If that instruction makes sense, great. If it's garbage, the CPU will fault or behave unpredictably. There's no validation, no safety check, no error message. This is bare metal.
+
+> **Aside: The reset vector on real hardware**
+>
+> On real RISC-V boards, the reset vector typically points to a boot ROM — a small, read-only memory containing manufacturer-provided code. This boot ROM performs basic hardware initialization (setting up clocks, configuring the memory controller so DRAM becomes accessible) and then loads the next stage from somewhere: a SPI flash chip, an SD card, a UART download. The boot ROM is the first link in a *chain of trust* for secure boot implementations.
+>
+> On x86 PCs, the equivalent is the BIOS/UEFI firmware stored in a flash chip on the motherboard. The CPU starts at `0xFFFFFFF0` (which is near the top of the 32-bit address space), and the chipset maps the flash chip to that address range. The firmware runs, initializes hardware, and eventually loads a bootloader from disk.
+>
+> The pattern is universal across architectures: **hardware starts at a fixed address → firmware initializes the machine → firmware loads the next stage → eventually your OS runs.** The details differ wildly, but the structure is always the same.
+
+---
+
+## The Boot Stages: A Chain of Increasingly Capable Software
+
+On a real system, booting is not a single step. It's a chain of stages, each more capable than the last. Why? Because the very first code that runs has almost nothing to work with. DRAM might not be initialized. There's no filesystem. There might not even be enough memory to run a complex program. So the boot process is structured as a relay race:
+
+### Stage 0: Hardware Reset
+
+The CPU comes out of reset. All registers are in their reset state (typically zero or implementation-defined values). The program counter is at the reset vector. The CPU is in the highest privilege mode — on RISC-V, that's **M-mode** (Machine mode). There is no virtual memory. There are no interrupts configured. The CPU is a blank slate, ready to execute whatever instruction is at the reset vector.
+
+Important detail: on a multicore system, all cores come out of reset simultaneously, all starting at the same reset vector. One core is typically designated the "boot hart" (RISC-V terminology for a hardware thread), and the others are expected to park themselves (spin in a loop or enter a low-power wait state) until the boot hart tells them to do something useful. We're running single-core (`-smp 1`), so this isn't our problem, but it's good to know.
+
+### Stage 1: Boot ROM / First-Stage Firmware
+
+On real hardware, the [boot ROM](https://wiki.osdev.org/Bootloader) — or in QEMU's case, the trampoline at `0x1000` — performs the absolute minimum initialization required to get to the next stage. On a real chip, this might include:
+
+- Configuring the clock tree (setting the CPU's clock speed)
+- Initializing the [DRAM controller](https://en.wikipedia.org/wiki/Memory_controller) (so that RAM actually works)
+- Setting up a minimal stack
+- Loading the next stage from non-volatile storage (SPI flash, SD card, etc.)
+
+On QEMU with `-bios none`, this stage is trivialized: QEMU has already "initialized" everything (it's an emulator — the virtual hardware starts fully configured), so the trampoline just jumps to `0x80000000`.
+
+### Stage 2: Firmware (OpenSBI, on RISC-V)
+
+In a standard RISC-V boot flow, the next stage is firmware that runs in M-mode. On RISC-V, this is typically **[OpenSBI](https://github.com/riscv-software-src/opensbi)** (Open Supervisor Binary Interface). OpenSBI:
+
+1. Performs platform-specific hardware initialization
+2. Sets up the **SBI** — a standardized interface that provides services to the operating system (like console I/O, timer management, and inter-processor interrupts)
+3. Configures the CPU for the next stage: sets up the trap vector for M-mode traps, configures interrupt delegation (which exceptions/interrupts should be handled in S-mode vs. M-mode), and prepares the registers for the transition to S-mode
+4. Drops to S-mode and jumps to the operating system's entry point
+
+The SBI is like a thin [HAL (Hardware Abstraction Layer)](https://en.wikipedia.org/wiki/Hardware_abstraction) between the hardware and the OS. It lets the OS request services without knowing the platform-specific details. For example, the OS can ask SBI to print a character to the console, and SBI routes that to whatever serial port the platform has. This is analogous to how on x86, the BIOS provided `INT 10h` for screen output and `INT 13h` for disk access.
+
+**We are skipping this stage.** With `-bios none`, there is no OpenSBI. This means:
+
+- Your kernel starts in **M-mode**, the highest privilege level. A normal OS kernel runs in S-mode.
+- You must handle M-mode traps yourself.
+- You must configure interrupt delegation yourself.
+- You must transition from M-mode to S-mode yourself (when you're ready).
+- You don't have SBI services. No `sbi_console_putchar()`. You talk to the UART directly.
+
+This is more work, but it means you understand every layer.
+
+### Stage 3: The Bootloader
+
+On a real system, between firmware and the OS kernel, there's often a [bootloader](https://wiki.osdev.org/Bootloader) (like GRUB on x86, or U-Boot on embedded systems). The bootloader's job is to:
+
+1. Present a menu (if multiple OSes are installed)
+2. Load the kernel image from a filesystem on disk into RAM
+3. Possibly load an initial ramdisk ([initrd/initramfs](https://en.wikipedia.org/wiki/Initial_ramdisk))
+4. Set up a data structure (like a [device tree](https://www.devicetree.org/specifications/) or memory map) that tells the kernel about the hardware configuration
+5. Jump to the kernel's entry point
+
+We're also skipping this stage. QEMU's `-kernel` flag takes care of loading your ELF into RAM. In a real deployment, you'd need a bootloader, but for learning, QEMU is your bootloader.
+
+### Stage 4: The Operating System
+
+Finally, *you*. Your kernel entry point runs. It's been a long road from the reset vector to here, even though on QEMU with `-bios none`, most of the intermediate stages are either trivialized or skipped.
+
+> **Aside: The Device Tree**
+>
+> How does an OS know what hardware it's running on? On x86, there's ACPI — a complex firmware interface that describes the hardware topology. On RISC-V (and ARM), the standard mechanism is a **[Device Tree Blob (DTB)](https://www.devicetree.org/specifications/)**: a binary data structure that describes the machine's hardware: how many CPUs, how much RAM, what devices exist at what addresses, and what interrupt lines they use.
+>
+> When QEMU boots your kernel, it passes a pointer to the DTB in register `a1`. (Register `a0` holds the hart ID — the ID of the CPU core that's running your code.) A real OS kernel parses the DTB to discover hardware at runtime instead of hardcoding device addresses. For our teaching OS, we'll hardcode the QEMU `virt` machine's addresses, because they're stable and well-documented. But know that the DTB is there, and parsing it is what you'd do on real hardware.
+>
+> The device tree format is defined by the [devicetree.org specification](https://www.devicetree.org/specifications/). The Linux kernel's device tree documentation is also an excellent resource. The [xv6 teaching OS](https://github.com/mit-pdos/xv6-riscv) also hardcodes its device addresses, so we're in good company.
+
+---
+
+## Privilege Modes: The Vertical Structure of Control
+
+We've mentioned M-mode and S-mode without fully explaining them. This is a preview — Chapter 4 goes into full detail — but you need a basic understanding to grasp the boot process.
+
+[RISC-V](https://riscv.org/technical/specifications/) defines three [privilege modes](https://en.wikipedia.org/wiki/Privilege_level), each with different powers:
+
+```
+┌─────────────────────────────────────────────┐
+│  M-mode (Machine mode)                      │
+│  The highest privilege. Full hardware access.│
+│  Firmware runs here.                        │
+├─────────────────────────────────────────────┤
+│  S-mode (Supervisor mode)                   │
+│  OS kernel runs here. Can manage virtual    │
+│  memory, handle most traps. Cannot directly │
+│  access some hardware features.             │
+├─────────────────────────────────────────────┤
+│  U-mode (User mode)                         │
+│  Application code runs here. Cannot access  │
+│  hardware directly, cannot modify critical  │
+│  CPU state. Isolated by virtual memory.     │
+└─────────────────────────────────────────────┘
+```
+
+The CPU always runs in exactly one of these modes. When the CPU comes out of reset, it's in M-mode. Each mode has its own set of CSRs (Control and Status Registers) and its own trap handling mechanism. Moving from a higher privilege to a lower one is deliberate — you set up some registers and execute a special return instruction. Moving from a lower privilege to a higher one only happens through traps (exceptions, interrupts, or explicit `ecall` instructions).
+
+**The standard boot flow on RISC-V is:**
+
+1. CPU starts in M-mode → firmware runs
+2. Firmware configures the machine, then drops to S-mode → OS kernel runs
+3. OS kernel sets up user environments, then drops to U-mode → applications run
+
+Since we're using `-bios none`, our kernel starts in M-mode instead of S-mode. We'll initially do everything in M-mode, then in a later chapter, transition to S-mode. This is unconventional, but it means you'll understand both modes.
+
+---
+
+## What Happens at `0x80000000`: Your Entry Point
+
+Let's trace the exact sequence of events from QEMU startup to your code running:
+
+1. **QEMU starts.** It creates the virtual machine: allocates 128 MiB of simulated RAM starting at `0x80000000`, creates the virtual UART at `0x10000000`, the CLINT at `0x02000000`, etc. It generates a device tree blob and places it somewhere in RAM.
+
+2. **QEMU loads your kernel.** It reads your ELF file, examines the program headers, and copies the loadable segments into the simulated RAM at the addresses specified in the ELF. Your `.text` section goes to `0x80000000` (because your linker script says so). Your `.data` and `.bss` follow.
+
+3. **QEMU sets up the CPU.** It initializes the virtual CPU: sets the privilege mode to M-mode, sets the program counter to the reset vector (`0x1000`), clears (or sets to implementation-defined values) all general-purpose registers. It places the hart ID in `a0` and a pointer to the DTB in `a1`.
+
+4. **The CPU executes the trampoline.** The instructions at `0x1000` load the address `0x80000000` and jump there. (Or more precisely, they load the entry point address from the ELF header, which should be `0x80000000` if your linker script sets `_start` correctly.)
+
+5. **Your code runs.** The instruction at `0x80000000` — the first instruction of your `_start` label in `boot.S` — executes. You're now in control.
+
+At this moment, the state of the machine is:
+
+| What | State |
+|------|-------|
+| Privilege mode | M-mode |
+| Program counter | `0x80000000` |
+| Stack pointer (`sp`) | **Undefined** — you must set it |
+| Other registers | Mostly zero or undefined, except `a0` (hart ID) and `a1` (DTB pointer) |
+| Virtual memory | **Off** — all addresses are physical |
+| Interrupts | **Disabled** — no interrupts will fire until you enable them |
+| `.bss` section | **Not zeroed** — raw RAM contents, potentially garbage |
+| UART | Exists at `0x10000000` but not initialized by you yet |
+| Timer | Exists but not configured |
+
+This is the tabula rasa. Everything from here is your responsibility.
+
+### The Boot Assembly Stub
+
+Your `boot.S` is the first code to execute. It's written in assembly because it must do things C cannot:
+
+**1. Set the [stack pointer](https://en.wikipedia.org/wiki/Call_stack).** C function calls push data onto the stack. If `sp` doesn't point to valid memory, the first function call corrupts random memory. Your assembly stub sets `sp` to the top of a pre-allocated stack region.
+
+**2. Zero the [`.bss` section](https://wiki.osdev.org/Memory_Layout).** The C standard guarantees that uninitialized global variables start at zero. Your boot stub loops through `_bss_start` to `_bss_end` (symbols from the linker script) and writes zeros. Skip this and your global variables will contain garbage.
+
+**3. Jump to `kernel_main()`.** Once the environment is minimally sane — valid stack, zeroed BSS — you call your C entry point. From here on, you can write C.
+
+That's the entire boot stub. Three responsibilities. In more complex setups (multicore, hardware initialization), the boot stub does more, but for a single-core QEMU setup with `-bios none`, these three are all you need to reach C code.
+
+> **Aside: Why the boot stub is in assembly, not C**
+>
+> This might seem like a chicken-and-egg problem: you need C for complex logic, but C needs a stack, but the stack needs to be set up by code that runs without a stack. Assembly is the solution because assembly doesn't implicitly use the stack. Every instruction does exactly what it says — there's no hidden prologue that pushes a frame pointer, no implicit function call overhead. You can write `la sp, stack_top` without needing a stack to execute that instruction.
+>
+> Some OS developers minimize the assembly boot stub to the absolute minimum (set `sp`, call C) and do everything else — including BSS zeroing — in C. This works fine as long as the C function that zeros BSS doesn't use any uninitialized global variables. It's a reasonable choice. The only hard requirement for assembly is setting the stack pointer.
+
+---
+
+## The ELF Format: How Your Binary Is Structured
+
+Your cross-compiler produces [ELF (Executable and Linkable Format)](https://refspecs.linuxfoundation.org/elf/elf.pdf) binaries. ELF is the standard binary format on Linux, BSD, and most Unix-like systems. It's also what QEMU expects when you use the `-kernel` flag.
+
+Understanding ELF matters because it's the contract between your toolchain and QEMU. The ELF file tells QEMU: "Here are the sections of my kernel, here's where each one should go in memory, and here's my entry point."
+
+### ELF Structure (High Level)
+
+An ELF file consists of:
+
+```
+┌──────────────────────┐
+│     ELF Header       │  ← Identifies the file as ELF, specifies architecture,
+│                      │     entry point address, and offsets to the tables below
+├──────────────────────┤
+│  Program Headers     │  ← Array of "segments" — tells the loader what to load
+│  (PHDRs)             │     into memory and where
+├──────────────────────┤
+│                      │
+│   Section Data       │  ← The actual content: .text, .rodata, .data, .bss, etc.
+│                      │
+├──────────────────────┤
+│  Section Headers     │  ← Array of "sections" — tells tools (debugger, objdump)
+│  (SHDRs)             │     about the logical organization
+└──────────────────────┘
+```
+
+**The ELF header** is at the very start of the file. It contains:
+- A magic number (`0x7f 'E' 'L' 'F'`) that identifies the file as ELF
+- The architecture (RISC-V, 64-bit, little-endian)
+- The **entry point address** — the virtual address of the first instruction to execute. This comes from the `ENTRY(_start)` directive in your linker script.
+- Offsets and sizes for the program header table and section header table
+
+**Program headers** are what a *[loader](https://en.wikipedia.org/wiki/Loader_%28computing%29)* cares about. Each program header describes a [segment](https://en.wikipedia.org/wiki/Segmentation_%28memory%29): a contiguous chunk of data that should be loaded into memory at a specific address. A segment has:
+- A type (`PT_LOAD` means "load this into memory")
+- A file offset (where the data is in the ELF file)
+- A physical address and virtual address (where to put it in memory)
+- A size in the file and a size in memory (the memory size can be larger than the file size — the extra bytes are zeroed, which is how `.bss` works)
+- Permission flags (read, write, execute)
+
+When QEMU processes `-kernel your_kernel.elf`, it reads the program headers, finds the `PT_LOAD` segments, and copies them to the specified addresses in simulated RAM. Then it sets the PC to the entry point.
+
+**Section headers** are what *tools* care about. They describe logical sections: `.text`, `.rodata`, `.data`, `.bss`, `.symtab` (symbol table), `.strtab` (string table), etc. The debugger uses section headers to find function names and source line information. `objdump` uses them to disassemble specific sections. The loader (QEMU) typically ignores section headers and only cares about program headers.
+
+### Inspecting Your ELF
+
+Two commands you should run regularly:
+
+**`riscv64-unknown-elf-objdump -h kernel.elf`** — Shows all section headers with their addresses and sizes. Verify that `.text` starts at `0x80000000`.
+
+**`riscv64-unknown-elf-readelf -l kernel.elf`** — Shows program headers (segments). Verify that you have `LOAD` segments with the correct addresses and permissions.
+
+**`riscv64-unknown-elf-readelf -h kernel.elf`** — Shows the ELF header. Verify that the entry point is `0x80000000` (or wherever `_start` is).
+
+**`riscv64-unknown-elf-objdump -d kernel.elf`** — Disassembles the entire binary. For a small kernel, this is readable. Check that the first instructions at `0x80000000` are your boot stub.
+
+> **Aside: ELF vs. raw binary**
+>
+> QEMU's `-kernel` flag understands ELF. But some bootloaders and some hardware expect a raw binary image — just the bytes, no headers, no metadata. You can convert an ELF to a raw binary with `objcopy -O binary kernel.elf kernel.bin`. The raw binary contains only the loadable content, starting from the lowest address. It's smaller but loses all metadata (entry point, section names, symbols).
+>
+> For our QEMU setup, ELF is the right choice. The entry point is embedded in the ELF header, and QEMU uses it to know where to jump. With a raw binary, you'd need to tell QEMU the entry point separately.
+>
+> CS:APP Chapter 7 (Linking) covers [ELF in detail](https://refspecs.linuxfoundation.org/elf/elf.pdf) — the structure of object files, symbol resolution, relocation, and the difference between linkable objects (`.o` files) and executable ELF files. It's excellent background reading.
+
+---
+
+## The Memory Map at Boot
+
+When your kernel starts executing, physical memory is laid out like this (for the QEMU `virt` machine):
+
+```
+Physical Address Space
+┌──────────────────────┐ 0x0000_0000
+│   Debug ROM / Boot   │
+│   ROM / Trampoline   │ ← Reset vector at 0x1000
+├──────────────────────┤ 0x0200_0000
+│       CLINT          │ ← Timer, software interrupts
+├──────────────────────┤ 0x0C00_0000
+│       PLIC           │ ← External interrupt controller
+├──────────────────────┤ 0x1000_0000
+│       UART0          │ ← Serial port
+├──────────────────────┤ 0x1000_1000
+│     virtio MMIO      │ ← Block devices, etc.
+├──────────────────────┤
+│       ...            │ ← Other device regions
+├──────────────────────┤ 0x8000_0000
+│                      │
+│                      │
+│       DRAM           │ ← 128 MiB of RAM
+│    (your kernel is   │    Your kernel code and data
+│     loaded here)     │    live at the bottom of this
+│                      │
+│                      │
+└──────────────────────┘ 0x8800_0000 (with -m 128M)
+```
+
+Several things to notice:
+
+**RAM doesn't start at zero.** On many embedded systems and on the QEMU `virt` machine, RAM starts at a high address (`0x80000000`). The lower addresses are occupied by ROM, device registers, and the interrupt controllers. If your code tries to use address `0x0` as regular memory, it's accessing the debug ROM region, not RAM.
+
+**There are holes.** The address space is not contiguous. Between `0x10001000` and `0x80000000` is a vast wasteland of unmapped or reserved address space. Accessing an unmapped address will cause a fault (a load/store access fault, specifically).
+
+**Your kernel sits at the bottom of DRAM.** The ELF loader placed your `.text`, `.rodata`, `.data`, and `.bss` sections starting at `0x80000000`. Everything above your kernel's end (the `_kernel_end` symbol from your linker script) is free memory — that's the pool your physical memory allocator will manage (Chapter 9).
+
+**Devices are memory-mapped.** The UART at `0x10000000`, the CLINT at `0x02000000`, the PLIC at `0x0C000000` — these aren't RAM. They're hardware registers. Reading and writing to these addresses communicates with hardware devices, not with memory. This is the memory-mapped I/O model.
+
+---
+
+## The M-mode Environment
+
+Since we're booting with `-bios none`, your kernel starts in M-mode. Let's understand what that means for your early boot code.
+
+### What M-mode Gives You
+
+M-mode is the most privileged level. Code running in M-mode can:
+
+- Access *all* CSRs, including the M-mode CSRs (`mstatus`, `mtvec`, `mcause`, `mepc`, `mie`, `mip`, `medeleg`, `mideleg`, `mscratch`, etc.)
+- Access *all* physical memory with no restrictions
+- Control interrupt delegation — decide which traps are handled in M-mode and which are delegated to S-mode
+- Execute all instructions, including privileged ones like `mret` (return from M-mode trap), `wfi` (wait for interrupt), and CSR manipulation
+
+### Initial CSR State
+
+When the CPU comes out of reset, the CSRs that matter to you are in these states:
+
+- **`mstatus`**: The Machine Status Register. At reset, the MIE (Machine Interrupt Enable) bit is clear, meaning interrupts are globally disabled. This is good — you don't want interrupts firing before you've set up a trap handler.
+- **`mtvec`**: The Machine Trap Vector. At reset, this contains an implementation-defined value (often zero). This register holds the address of your trap handler. If a trap occurs before you set `mtvec`, the CPU will jump to whatever address is there — probably `0x0`, which will crash. Setting `mtvec` to point to your trap handler is one of the first things you'll do.
+- **`mie`**: Machine Interrupt Enable register. Individual enable bits for different interrupt types: software, timer, external. At reset, all are clear (disabled).
+- **`medeleg` / `mideleg`**: Exception and interrupt delegation registers. These control which traps are delegated from M-mode to S-mode. At reset, nothing is delegated — all traps are handled in M-mode.
+
+### The Transition to S-mode (Preview)
+
+Eventually, you'll want your kernel to run in S-mode, like a real OS. The transition from M-mode to S-mode is deliberate:
+
+1. Set up S-mode trap handling (set `stvec`)
+2. Configure interrupt delegation (`medeleg`, `mideleg`) so that most traps go to S-mode
+3. Set the `mstatus.MPP` field to indicate that the "previous" privilege mode was S-mode
+4. Set `mepc` to the address you want to start executing in S-mode
+5. Execute `mret`
+
+The `mret` instruction returns from a "trap" to the privilege level indicated by `mstatus.MPP` and the address in `mepc`. By setting MPP to S-mode and `mepc` to your kernel entry point, `mret` effectively drops you from M-mode to S-mode at your chosen address. It's a bit of a hack — you're pretending that you arrived in M-mode via a trap from S-mode, and now you're "returning" — but it's the standard way to change privilege levels downward.
+
+We won't do this transition until later. For now, we'll run entirely in M-mode. This is simpler for early development and lets us interact with hardware directly.
+
+> **Aside: Why not just stay in M-mode?**
+>
+> M-mode has no virtual memory. There's no `satp` register equivalent in M-mode — the MMU only applies to S-mode and U-mode. If you stay in M-mode, you can't use page tables, which means you can't have separate address spaces for processes, which means you can't have real process isolation. M-mode is the firmware's domain. The OS belongs in S-mode.
+>
+> There's actually a draft extension (Smmtt) that would allow M-mode to use address translation, but it's not standard and QEMU doesn't support it. The standard RISC-V architecture assumes: M-mode = firmware (no translation), S-mode = OS (translation available), U-mode = applications (translated, restricted).
+>
+> The xv6 teaching OS, by contrast, boots on top of OpenSBI, starts directly in S-mode, and never deals with M-mode. That's cleaner in some ways, but it means xv6 students never see what happens "below" S-mode. We're taking the harder path so you see the full picture.
+
+---
+
+## What the Firmware Would Have Done
+
+Since we're not using OpenSBI, it's worth knowing what we're missing — because these are things we'll need to handle ourselves, or explicitly decide not to handle.
+
+**Console I/O.** OpenSBI provides `sbi_console_putchar()` and `sbi_console_getchar()` — functions the OS can call (via `ecall` from S-mode to M-mode) to read and write characters on the serial console. Without OpenSBI, we'll talk to the UART hardware directly. This is actually simpler and more educational.
+
+**Timer management.** OpenSBI provides `sbi_set_timer()` to set the next timer interrupt. Without OpenSBI, we'll program the CLINT's `mtimecmp` register directly. Again, more educational.
+
+**Inter-processor interrupts.** On multicore systems, OpenSBI provides `sbi_send_ipi()` to send IPIs to other cores. We're single-core, so this doesn't matter.
+
+**Hardware probing.** OpenSBI can tell the OS about available hardware extensions. We'll hardcode our assumptions about the QEMU `virt` machine.
+
+**Shutdown / reboot.** OpenSBI provides `sbi_shutdown()`. Without it, we'll need to either use the QEMU `finisher` device (a QEMU-specific MMIO device at `0x100000`) or just spin forever to "halt."
+
+The point is: OpenSBI is a convenience layer, not a mystery. Everything it does, you can do directly. It just saves you from platform-specific details. On QEMU, those details are simple enough that going direct is not a hardship.
+
+---
+
+## Boot on Other Architectures (For Perspective)
+
+Understanding how other architectures boot gives you perspective on why RISC-V works the way it does.
+
+### x86: The Legacy Labyrinth
+
+The x86 boot process is notoriously complex, weighed down by four decades of backward compatibility:
+
+1. CPU starts in **real mode** (16-bit, no protection, 1 MiB addressable)
+2. BIOS runs from ROM, performs POST (Power-On Self-Test), initializes hardware
+3. BIOS loads the first sector (512 bytes!) of the boot disk into memory at `0x7C00`
+4. The bootloader (often GRUB) runs in real mode, switches to **protected mode** (32-bit), loads the kernel
+5. The kernel may switch to **long mode** (64-bit)
+
+Or, on modern systems with UEFI:
+1. CPU starts in a more modern mode
+2. UEFI firmware runs, providing a rich pre-boot environment with drivers, filesystems, and a shell
+3. UEFI loads an EFI application (the bootloader or kernel) from an EFI System Partition
+4. The bootloader/kernel takes over
+
+The complexity of x86 booting — real mode, A20 gate, the 512-byte boot sector limitation, the transition through three processor modes — is a consequence of maintaining compatibility back to the 8086 from 1978. RISC-V, designed in the 2010s, has none of this baggage.
+
+### ARM: Device Tree and Multiple Entry Points
+
+ARM systems typically boot with:
+1. Boot ROM → First-stage bootloader (often manufacturer-specific)
+2. U-Boot or similar → Loads kernel image and device tree
+3. Kernel starts in a high privilege mode (EL3 or EL2), transitions down to EL1
+
+ARM shares RISC-V's use of device trees for hardware description and a similar privilege hierarchy (EL0/EL1/EL2/EL3 instead of U/S/H/M modes). If you later work with ARM, the concepts transfer directly.
+
+The universal lesson: **every architecture has the same conceptual stages (hardware reset → firmware → bootloader → OS), but the specific mechanisms, privilege transitions, and addressing modes differ.** Understanding one deeply makes learning others much faster.
+
+---
+
+## Putting It All Together: The Boot Timeline
+
+Let's trace the complete boot sequence for our specific setup (QEMU, `-bios none`, `-kernel kernel.elf`):
+
+```
+Time ─────────────────────────────────────────────────────────────────►
+
+     QEMU                    CPU                      Your Code
+     ────                    ───                      ─────────
+
+ 1.  Initializes virtual
+     hardware, loads ELF
+     into RAM at 0x8000_0000
+
+ 2.  Places trampoline at
+     0x1000, starts CPU
+
+ 3.                           PC = 0x1000
+                              Mode = M-mode
+                              Executes trampoline:
+                              loads 0x8000_0000,
+                              jumps
+
+ 4.                           PC = 0x8000_0000        _start:
+                                                       • Set sp
+                                                       • Zero .bss
+                                                       • Call kernel_main
+
+ 5.                                                   kernel_main():
+                                                       • You're in C!
+                                                       • Set up UART
+                                                       • Set up traps
+                                                       • ... the rest
+                                                        of this guide
+```
+
+That's it. Five steps from power-on to your C code running. On a real system with full firmware and a bootloader, there would be dozens of substeps, but the conceptual flow is identical.
+
+---
+
+## Conceptual Exercises
+
+1. **Why does the CPU start at a fixed address rather than reading the entry point from the ELF header directly?** Who or what puts code at the reset vector? (Think about what exists before any software runs.)
+
+2. **What would happen if you used `-bios default` instead of `-bios none`?** Where would your kernel need to be loaded? What privilege mode would it start in? What services would be available to it?
+
+3. **Why does the boot process have multiple stages instead of jumping directly from hardware reset to the OS kernel?** What constraints make a single-stage boot impossible or impractical on real hardware?
+
+4. **Register `a0` contains the hart ID and `a1` contains the DTB pointer at kernel entry. Who set these values?** At what point in the boot sequence were they placed in those registers?
+
+5. **Why must the BSS be zeroed before calling C code?** Give a specific example of a bug that would occur if you skipped this step. (Think about a global variable declaration.)
+
+6. **Your linker script places `.text` at `0x80000000`, but the CPU starts at `0x1000`. If you changed your linker script to place `.text` at `0x1000` instead, would your kernel work?** Why or why not? (Think about what else is at that address range and whether it's RAM.)
+
+7. **Explain why setting the stack pointer is the one thing that absolutely cannot be done in C.** What would happen if `kernel_main()` were the very first function called, with no assembly boot stub?
+
+---
+
+## Build This
+
+You already have an infinite-loop boot stub from Chapter 1. Now upgrade it to a real boot sequence:
+
+**Modify `boot.S` to:**
+
+1. Declare a stack region (a `.section .bss` block with an appropriately sized array and a `stack_top` label at the end). 4096 bytes is enough for now.
+2. Load the address of `stack_top` into `sp`.
+3. Load `_bss_start` and `_bss_end` from your linker script and zero the entire `.bss` section with a loop.
+4. Call `kernel_main`. Use `call kernel_main` or `jal kernel_main` — they both work for a forward reference within the same binary.
+5. After `kernel_main` returns (it shouldn't, but defensively), enter an infinite loop so the CPU doesn't wander off into garbage memory.
+
+**Modify `main.c` to:**
+
+1. Have `kernel_main()` enter an infinite loop (just `while(1) {}` for now). It doesn't do anything useful yet — we need UART output first (Chapter 6).
+
+**Checkpoint:** Run `make run`. QEMU should start and appear to hang (your kernel is in an infinite loop, which is correct). Connect GDB:
+
+```
+# Terminal 1:
+make debug    # starts QEMU with -s -S
+
+# Terminal 2:
+riscv64-unknown-elf-gdb build/kernel.elf
+(gdb) target remote :1234
+(gdb) break kernel_main
+(gdb) continue
+```
+
+If GDB hits the breakpoint at `kernel_main`, your boot sequence works. The CPU started at the reset vector, jumped to `_start`, set up the stack, zeroed BSS, and called into C. You've just booted a kernel.
+
+Use `info registers` in GDB to verify that `sp` points to your stack region and that `pc` is at `kernel_main`.
+
+---
+
+## When Things Go Wrong
+
+**GDB never hits the `kernel_main` breakpoint**
+Your boot stub isn't reaching the `call kernel_main` instruction. Possible causes:
+- The BSS zeroing loop has a bug and never terminates (e.g., `_bss_start` and `_bss_end` are both zero because your linker script doesn't define them correctly)
+- The stack pointer is set to an invalid address, so the `call` instruction faults when trying to push the return address
+- Set a breakpoint at `_start` instead and single-step through the assembly with `stepi`
+
+**"Cannot access memory at address 0x..."**
+If you see this in GDB, you're accessing an unmapped region. Check your `sp` value — if it's zero or points below `0x80000000`, it's not in RAM.
+
+**The BSS loop never terminates**
+Use GDB to check the values loaded for `_bss_start` and `_bss_end`. If they're both zero, your linker script isn't providing them. Make sure the symbols are defined *inside* the `SECTIONS {}` block of your linker script, not outside it. Also make sure you're using `PROVIDE()` or direct assignment correctly.
+
+**"Illegal instruction" trap immediately at boot**
+Your entry point might not be aligned correctly, or the instructions at `0x80000000` aren't what you think they are. Run `objdump -d kernel.elf | head -30` and verify that the disassembly at `0x80000000` matches your `boot.S`. If the disassembly shows `.data` contents instead of instructions, your linker script is putting the wrong section first.
+
+**QEMU prints "qemu: could not load kernel"**
+Your ELF file is malformed, the path is wrong, or the architecture doesn't match. Make sure you're producing a RISC-V 64-bit ELF. Check with `file kernel.elf` — it should say something like "ELF 64-bit LSB executable, UCB RISC-V."
+
+**Multiple harts (cores) trying to boot simultaneously**
+Even with `-smp 1`, some QEMU versions may start multiple harts. If you see strange behavior, add a check at the start of `boot.S`: read the hart ID from `a0` (or from the `mhartid` CSR), and if it's not zero, jump to an infinite loop. Only hart 0 should proceed with the boot sequence. This is good practice even for single-core development.
+
+---
+
+## Further Reading
+
+- **RISC-V Privileged Specification, Chapter 3** — Machine-Level ISA, including reset behavior, M-mode CSRs, and the `mret` instruction. This is the definitive reference for M-mode.
+- **CS:APP Chapter 7: Linking** — ELF format, program headers, linking process. Essential for understanding how your toolchain produces the binary QEMU loads.
+- **xv6 Book, Chapter 2: Operating System Organization** — Cox, Kaashoek, and Morris describe xv6's boot process, which starts in M-mode (on OpenSBI), transitions to S-mode, and reaches the kernel. A good comparison point for our approach.
+- **OSTEP Chapter 6: Mechanism: Limited Direct Execution** — Arpaci-Dusseau introduces the concept of restricted operations and privilege modes. Excellent conceptual foundation for understanding why M-mode and S-mode exist.
+- **The OpenSBI documentation** (on GitHub: `riscv-software-src/opensbi`) — If you want to understand what OpenSBI actually does, read its documentation and the `lib/sbi/` source. It's well-written C.
+- **QEMU `hw/riscv/virt.c`** — The QEMU source file that defines the `virt` machine, including the memory map, the reset vector trampoline, and default device placement. When in doubt about the machine's behavior, this is the source of truth.
+
+---
+
+*Next: [Chapter 4 — The RISC-V Architecture](ch04-riscv-architecture.md), where we dive deep into the CPU itself: registers, privilege modes, CSRs, and the hardware contract your OS must honor.*
